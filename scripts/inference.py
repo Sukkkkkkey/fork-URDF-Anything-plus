@@ -27,6 +27,12 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--dino_path", type=str, default="DINOv3")
     parser.add_argument(
+        "--triposg_vae_path",
+        type=str,
+        default=None,
+        help="TripoSG VAE directory; overrides the path in the model config",
+    )
+    parser.add_argument(
         "--in_the_wild",
         action="store_true",
         help="use TripoSG to generate whole mesh from image",
@@ -51,6 +57,7 @@ def main():
     parser.add_argument("--rmbg_weights_dir", type=str, default=None)
     parser.add_argument("--eot_threshold", type=float, default=0.5)
     parser.add_argument("--max_reconstruction_attempts", type=int, default=3)
+    parser.add_argument("--max_links", type=int, default=16)
     parser.add_argument("--overlap_chamfer_threshold", type=float, default=3e-2)
     parser.add_argument(
         "--seed",
@@ -70,6 +77,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.triposg_vae_path:
+        os.environ["URDF_ANYTHING_TRIPOSG_VAE_PATH"] = args.triposg_vae_path
 
     # Must be set before some CUDA kernels are initialized
     os.environ["PYTHONHASHSEED"] = str(args.seed)
@@ -119,6 +129,7 @@ def main():
         eot_threshold=args.eot_threshold,
         max_reconstruction_attempts=args.max_reconstruction_attempts,
         overlap_chamfer_threshold=args.overlap_chamfer_threshold,
+        max_links=args.max_links,
         seed=args.seed,
         vae_deterministic=args.vae_deterministic,
     )

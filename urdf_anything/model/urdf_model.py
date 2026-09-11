@@ -89,8 +89,11 @@ class URDFModel(nn.Module):
 
     def Build_3D_EncoderDecoder(self):
         model_3d_config = self.config.get("model_3d", {})
-        pretrained_path = model_3d_config.get(
-            "pretrained_path", "TripoSG/pretrained_weights/TripoSG"
+        pretrained_path = os.environ.get(
+            "URDF_ANYTHING_TRIPOSG_VAE_PATH",
+            model_3d_config.get(
+                "pretrained_path", "TripoSG/pretrained_weights/TripoSG"
+            ),
         )
         subfolder = model_3d_config.get("subfolder", "vae")
         self.model_3d = TripoSGVAEModel.from_pretrained(

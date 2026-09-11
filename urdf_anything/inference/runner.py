@@ -26,6 +26,7 @@ class URDFInference:
         eot_threshold: float = 0.5,
         max_reconstruction_attempts: int = 5,
         overlap_chamfer_threshold: float = 1e-4,
+        max_links: int = 16,
         seed: int = 42,
         vae_deterministic: bool = False,
     ):
@@ -34,6 +35,9 @@ class URDFInference:
         self.eot_threshold = eot_threshold
         self.max_reconstruction_attempts = max_reconstruction_attempts
         self.overlap_chamfer_threshold = overlap_chamfer_threshold
+        if max_links < 1:
+            raise ValueError("max_links must be at least 1")
+        self.max_links = int(max_links)
         self.seed = int(seed)
         self.vae_deterministic = bool(vae_deterministic)
 
@@ -76,6 +80,11 @@ class URDFInference:
     def mesh_to_encode_whole(
         self, mesh: trimesh.Trimesh, num_pc: int = 204800
     ) -> torch.Tensor:
+        if isinstance(mesh, trimesh.Scene):
+            geometries = list(mesh.geometry.values())
+            if not geometries:
+                raise ValueError("input scene contains no mesh geometry")
+            mesh = trimesh.util.concatenate(geometries)
         if not isinstance(mesh, trimesh.Trimesh):
             if hasattr(mesh, "vertices") and hasattr(mesh, "faces"):
                 vertices = (
@@ -311,7 +320,7 @@ class URDFInference:
             mesh = whole_mesh
         elif whole_mesh_path is not None:
             print(f"loading whole mesh from file: {whole_mesh_path}")
-            mesh = trimesh.load(whole_mesh_path)
+            mesh = trimesh.load(whole_mesh_path, force="mesh")
         else:
             raise ValueError("must provide whole_mesh or whole_mesh_path")
 
@@ -323,7 +332,7 @@ class URDFInference:
         prev_meshes = []
         all_results = []
 
-        while True:
+        while link_idx < self.max_links:
             print(f"\ngenerating Link {link_idx}...")
             result = self.reconstruct_link_with_retry(
                 dino_features, encode_pre, encode_whole, link_idx
@@ -374,8 +383,12 @@ class URDFInference:
                         )
                         print(f"  Motion Type: {motion_name}")
             all_results.append({"link_idx": link_idx, **result})
-            encode_pre = self.encode_prev_meshes(prev_meshes)
             link_idx += 1
+            if link_idx < self.max_links:
+                encode_pre = self.encode_prev_meshes(prev_meshes)
+
+        if link_idx >= self.max_links:
+            print(f"reached max_links={self.max_links}, stopping generation")
 
         if save_urdf and len(prev_meshes) > 0:
             urdf_path = os.path.join(output_dir, "generated.urdf")

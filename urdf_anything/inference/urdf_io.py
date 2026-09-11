@@ -1,5 +1,6 @@
 import os
 import xml.etree.ElementTree as ET
+import numpy as np
 import torch
 
 
@@ -51,8 +52,13 @@ def construct_urdf(
         if axis_xyz is not None:
             if isinstance(axis_xyz, torch.Tensor):
                 axis_xyz = axis_xyz.cpu().numpy()
-            idx = axis_xyz.argmax()
-            axis_str = ["1 0 0", "0 1 0", "0 0 1"][int(idx)]
+            axis_xyz = np.asarray(axis_xyz, dtype=np.float64)
+            axis_norm = np.linalg.norm(axis_xyz)
+            if np.isfinite(axis_norm) and axis_norm > 1e-8:
+                axis_xyz = axis_xyz / axis_norm
+                axis_str = " ".join(f"{value:.6f}" for value in axis_xyz)
+            else:
+                axis_str = "1 0 0"
         else:
             axis_str = "1 0 0"
         visual = ET.SubElement(link_elem, "visual", name=link_name)
@@ -87,8 +93,18 @@ def construct_urdf(
         if lower_upper_limits is not None:
             if isinstance(lower_upper_limits, torch.Tensor):
                 lower_upper_limits = lower_upper_limits.cpu().numpy()
-            limit_elem.set("lower", f"{lower_upper_limits[0]:.6f}")
-            limit_elem.set("upper", f"{lower_upper_limits[1]:.6f}")
+            lower_upper_limits = np.asarray(
+                lower_upper_limits, dtype=np.float64
+            ).reshape(-1)
+            if lower_upper_limits.size >= 2 and np.isfinite(
+                lower_upper_limits[:2]
+            ).all():
+                lower, upper = np.sort(lower_upper_limits[:2])
+                limit_elem.set("lower", f"{lower:.6f}")
+                limit_elem.set("upper", f"{upper:.6f}")
+            else:
+                limit_elem.set("lower", "-3.14159")
+                limit_elem.set("upper", "3.14159")
         else:
             limit_elem.set("lower", "-3.14159")
             limit_elem.set("upper", "3.14159")

@@ -160,6 +160,10 @@ You can try our inference script:
 bash scripts/inference.sh
 ```
 
+For the local PartNet-Mobility reproduction, including fixed paths, model
+downloads, preprocessing, batch inference, and evaluation, see
+[`RUNBOOK.md`](RUNBOOK.md).
+
 If you are in 'in_the_wild' mode, you should make sure the object is oriented towards the positive z direction. See the examples below, the z-axis is the blue line. 
 <p align="center">
   <img src="assets/laptop_example.png" alt="Laptop Example" width="33%" style="display:inline-block" />
