@@ -206,12 +206,15 @@ CUDA_VISIBLE_DEVICES=7 python evaluate.py \
 
 Particulate 的 `evaluate.py` 使用未固定随机种子的 Trimesh 表面采样；下述数值对应已保存的 77 个逐对象 JSON，清空评测目录后重跑可能在末位出现轻微波动。
 
-### 修正朝向结果的第一版 metric 与论文 Table 1 对比
+### 双 IoU URDF metric
 
-“第一版 metric”指 `comparison/evaluate_author_metrics.py`。此次保留其 100,000
-点采样、F-score 阈值 0.02、128³ surface-voxel IoU、平方 L2 CD、CD-Hungarian
-部件匹配和对象级聚合，仅用 `--urdf-coordinate world` 应用生成 URDF 的固定根
-关节，将模型坐标预测转换回 PartNet GT 坐标：
+`comparison/evaluate_author_metrics.py` 的 v4 协议默认同时输出 surface IoU 和
+volume IoU。两者共享 `[-1.01,1.01]³` 中的一次 128³ 表面栅格化；volume IoU
+再以三个轴向都被表面体素双向包围为条件填充实体内部，Whole occupancy 是各
+part occupancy 的并集。论文对比固定使用 volume IoU。每个对象 JSON 写入
+`comparison-local-v4-dual-iou`，`--resume` 遇到旧协议缓存时会自动重算。
+
+运行修正朝向的 URDF-Anything+：
 
 ```bash
 conda activate /home/LiuShuqi/.conda/envs/particulate
@@ -222,35 +225,53 @@ python -m comparison.evaluate_author_metrics \
   --prediction-root $URDF_ANYTHING_OUTPUT/inference/PartNetMobility-test-oriented \
   --gt-root /data2/LiuShuqi/data/processed/PartNetMobility_test_particulate/gt \
   --asset-root /data2/LiuShuqi/data/processed/PartNetMobility_test_particulate/assets \
-  --output-dir $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_oriented/urdf-anything-plus \
+  --output-dir $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_dual_iou/urdf-anything-plus \
   --urdf-coordinate world --resume
 ```
 
-生成旧朝向、修正朝向和论文 Table 1 的独立对比报告：
+运行 Particulate：
 
 ```bash
-python -m comparison.build_oriented_paper_comparison \
-  --oriented-summary $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_oriented/urdf-anything-plus/summary.json \
-  --unoriented-summary $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics/urdf-anything-plus/summary.json \
-  --output-dir $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_oriented/paper_comparison
+python -m comparison.evaluate_author_metrics \
+  --method particulate \
+  --prediction-root /data2/LiuShuqi/output/particulate/PartNetMobility-test-evaluation/predictions \
+  --gt-root /data2/LiuShuqi/data/processed/PartNetMobility_test_particulate/gt \
+  --asset-root /data2/LiuShuqi/data/processed/PartNetMobility_test_particulate/assets \
+  --output-dir $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_dual_iou/particulate \
+  --resume
 ```
 
-| Metric | 论文 Table 1 | 旧朝向 | 修正朝向 |
-|---|---:|---:|---:|
-| Parts IoU | 0.879 | 0.195182 | 0.321733 |
-| Parts F-score | 0.721 | 0.427521 | 0.621243 |
-| Parts CD | 0.033 | 0.180844 | 0.065410 |
-| Whole IoU | 0.930 | 0.316774 | 0.357589 |
-| Whole F-score | 0.742 | 0.633097 | 0.685852 |
-| Whole CD | 0.009 | 0.019815 | 0.008336 |
-| Axis error (rad) | 0.129 | 1.230936 | 0.446832 |
-| Origin error | 0.062 m | 0.621544（归一化坐标） | 0.143116（归一化坐标） |
-| Limit error (rad) | 0.225 | 2.450820 | 1.317631 |
+生成两方法横向报告：
 
-修正朝向后共有 169/243/158 个预测/GT/匹配部件，joint error 仅在预测类型
-正确的 62/103 个 GT revolute joints 上计算。Whole CD 已接近论文
-（0.008336 vs 0.009），但本地 IoU 是表面体素代理而非已确认的论文实体体积
-IoU，origin 也不是论文使用的米制数值，因此这三项不能作精确数值复现判断。
+```bash
+python -m comparison.build_metric_comparison \
+  --candidate-summary $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_dual_iou/urdf-anything-plus/summary.json \
+  --baseline-summary $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_dual_iou/particulate/summary.json \
+  --candidate-label 'URDF-Anything+' --baseline-label 'Particulate' \
+  --title 'URDF-Anything+ vs Particulate under dual-IoU URDF metrics' \
+  --output-dir $URDF_ANYTHING_OUTPUT/comparison/PartNetMobility-test/author_metrics_dual_iou/method_comparison
+```
+
+| Metric | URDF-Anything+ | Particulate |
+|---|---:|---:|
+| Parts surface IoU | 0.321733 | 0.970942 |
+| Parts volume IoU | 0.320077 | 0.955790 |
+| Parts F-score | 0.621243 | 0.987162 |
+| Parts CD | 0.065410 | 0.004489 |
+| Whole surface IoU | 0.357589 | 1.000000 |
+| Whole volume IoU | 0.322978 | 0.977165 |
+| Whole F-score | 0.685852 | 0.989819 |
+| Whole CD | 0.008336 | 0.000144 |
+| Axis error (rad) | 0.446832 | 0.000907 |
+| Origin error（归一化坐标） | 0.143116 | 0.024016 |
+| Limit error (rad) | 1.317631 | 0.139491 |
+| 匹配部件 / GT 部件 | 158/243 | 243/243 |
+| Revolute coverage | 62/103 | 103/103 |
+
+主表为 matched-only；报告同时写出两种 IoU、未匹配部件压力诊断和 joint
+coverage。Particulate 保留并分割输入 whole mesh，而 URDF-Anything+ 从相同
+GT mesh 条件解码新的 link geometry，因此几何指标差距包含方法输出表示差异，
+不能视为纯关节推理能力差距。
 
 ## 当前验证状态
 
@@ -261,6 +282,10 @@ IoU，origin 也不是论文使用的米制数值，因此这三项不能作精�
 - Particulate 协议评测完成 77/77 个对象，所有逐对象指标均为有限数值。
 - 修正朝向推理完成 77/77 个对象，共生成 169 个 link；第一版 metric 完成
   77/77 个对象，62/103 个 GT revolute joints 获得条件式 joint error。
+- 双 IoU v4 对 URDF-Anything+ 和 Particulate 均完成 77/77 个对象；一次运行
+  同时输出 surface/volume IoU，四个聚合值与此前两套独立实现精确一致。
+- Particulate 匹配 243/243 个 GT 部件并覆盖 103/103 个 GT revolute joints；
+  URDF-Anything+ 对应为 158/243 和 62/103。
 
 ## 当前复现结果
 
@@ -293,3 +318,6 @@ IoU，origin 也不是论文使用的米制数值，因此这三项不能作精�
 - 修正朝向第一版 metric：`/data2/LiuShuqi/output/URDF-Anything-plus/comparison/PartNetMobility-test/author_metrics_oriented/urdf-anything-plus`
 - 论文对比报告：`/data2/LiuShuqi/output/URDF-Anything-plus/comparison/PartNetMobility-test/author_metrics_oriented/paper_comparison`
 - 修正朝向评测日志：`/data2/LiuShuqi/output/URDF-Anything-plus/logs/evaluate_author_metrics_oriented.log`
+- 双 IoU v4 指标：`/data2/LiuShuqi/output/URDF-Anything-plus/comparison/PartNetMobility-test/author_metrics_dual_iou/{urdf-anything-plus,particulate}`
+- 双 IoU v4 横向报告：`/data2/LiuShuqi/output/URDF-Anything-plus/comparison/PartNetMobility-test/author_metrics_dual_iou/method_comparison`
+- 双 IoU v4 日志：`/data2/LiuShuqi/output/URDF-Anything-plus/logs/evaluate_author_metrics_{urdf,particulate}_dual_iou.log`

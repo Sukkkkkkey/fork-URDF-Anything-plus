@@ -29,6 +29,9 @@ import trimesh
 
 DEFAULT_DOMAIN = (-1.01, 1.01)
 DEFAULT_CD_MISSING_PENALTY = 12.0
+PROTOCOL_VERSION = "comparison-local-v4-dual-iou"
+PART_GEOMETRY_METRICS = ("iou_surface", "iou_volume", "fscore", "cd")
+WHOLE_GEOMETRY_METRICS = PART_GEOMETRY_METRICS
 
 
 def parse_args() -> argparse.Namespace:
@@ -398,15 +401,81 @@ def sample_geometry(
     return part_points, whole_points
 
 
-def surface_voxels(
+def fill_volume_voxels(
+    surface_voxels: np.ndarray, resolution: int
+) -> np.ndarray:
+    """Fill a surface grid using Trimesh's orthographic solid criterion.
+
+    A cell is interior when an occupied surface cell exists in both directions
+    along all three coordinate axes.  This is stable for the small topological
+    holes present in the PartNet CAD meshes, for which flood filling an
+    allegedly watertight shell is not reliable.
+    """
+    indices = np.asarray(surface_voxels, dtype=np.int64)
+    if resolution < 1:
+        raise ValueError("resolution must be positive")
+    voxel_count = resolution**3
+    if np.any(indices < 0) or np.any(indices >= voxel_count):
+        raise ValueError("surface voxel index outside evaluation grid")
+    if len(indices) == 0:
+        return indices.copy()
+
+    surface = np.zeros((resolution,) * 3, dtype=bool)
+    surface.flat[indices] = True
+    volume = np.ones_like(surface)
+    for axis in range(3):
+        from_low = np.logical_or.accumulate(surface, axis=axis)
+        reversed_surface = np.flip(surface, axis=axis)
+        from_high = np.flip(
+            np.logical_or.accumulate(reversed_surface, axis=axis), axis=axis
+        )
+        volume &= from_low & from_high
+    return np.flatnonzero(volume).astype(np.int64, copy=False)
+
+
+def union_voxel_parts(voxel_parts: dict[int, np.ndarray]) -> np.ndarray:
+    nonempty = [indices for indices in voxel_parts.values() if len(indices)]
+    return (
+        np.unique(np.concatenate(nonempty)).astype(np.int64)
+        if nonempty
+        else np.empty(0, dtype=np.int64)
+    )
+
+
+def voxel_occupancy_variants(
+    surface_parts: dict[int, np.ndarray], resolution: int
+) -> tuple[
+    dict[int, np.ndarray],
+    np.ndarray,
+    dict[int, np.ndarray],
+    np.ndarray,
+]:
+    volume_parts = {
+        part_id: fill_volume_voxels(indices, resolution)
+        for part_id, indices in surface_parts.items()
+    }
+    return (
+        surface_parts,
+        union_voxel_parts(surface_parts),
+        volume_parts,
+        union_voxel_parts(volume_parts),
+    )
+
+
+def voxelize_surface_and_volume(
     mesh: trimesh.Trimesh,
     labels: np.ndarray,
     resolution: int,
     domain_min: float,
     domain_max: float,
     dense_vertex_face_threshold: int,
-) -> tuple[dict[int, np.ndarray], np.ndarray]:
-    """Rasterize labeled surfaces with dense vertices or tri-axial rays."""
+) -> tuple[
+    dict[int, np.ndarray],
+    np.ndarray,
+    dict[int, np.ndarray],
+    np.ndarray,
+]:
+    """Rasterize labeled surfaces once and return surface and volume occupancy."""
     pitch = (domain_max - domain_min) / resolution
     if len(mesh.faces) >= dense_vertex_face_threshold:
         indices = np.floor((np.asarray(mesh.vertices) - domain_min) / pitch).astype(
@@ -422,19 +491,13 @@ def surface_voxels(
             vertex_indices = np.unique(mesh.faces[labels == part_id].reshape(-1))
             part_linear = linear[vertex_indices]
             unique_parts[int(part_id)] = np.unique(part_linear[part_linear >= 0])
-        nonempty = [values for values in unique_parts.values() if len(values)]
-        whole = (
-            np.unique(np.concatenate(nonempty)).astype(np.int64)
-            if nonempty
-            else np.empty(0, dtype=np.int64)
-        )
-        return unique_parts, whole
+        return voxel_occupancy_variants(unique_parts, resolution)
 
     try:
         from trimesh.ray.ray_pyembree import RayMeshIntersector
     except ImportError as error:
         raise RuntimeError(
-            "surface voxelization requires embreex; run in the particulate conda environment"
+            "volume voxelization requires embreex; run in the particulate conda environment"
         ) from error
 
     if domain_max <= domain_min:
@@ -474,13 +537,7 @@ def surface_voxels(
             if chunks
             else np.empty(0, dtype=np.int64)
         )
-    nonempty = [values for values in unique_parts.values() if len(values)]
-    whole = (
-        np.unique(np.concatenate(nonempty)).astype(np.int64)
-        if nonempty
-        else np.empty(0, dtype=np.int64)
-    )
-    return unique_parts, whole
+    return voxel_occupancy_variants(unique_parts, resolution)
 
 
 def voxel_iou(voxels_pred: np.ndarray, voxels_gt: np.ndarray) -> float:
@@ -534,22 +591,36 @@ def directional_part_average(
 def evaluate_part_geometry(
     pred_points: dict[int, np.ndarray],
     gt_points: dict[int, np.ndarray],
-    pred_voxels: dict[int, np.ndarray],
-    gt_voxels: dict[int, np.ndarray],
+    pred_surface_voxels: dict[int, np.ndarray],
+    gt_surface_voxels: dict[int, np.ndarray],
+    pred_volume_voxels: dict[int, np.ndarray],
+    gt_volume_voxels: dict[int, np.ndarray],
     pairs: list[tuple[int, int]],
     threshold: float,
     missing_cd_penalty: float,
     workers: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     pair_results: list[dict[str, Any]] = []
-    by_pred: dict[str, dict[int, float]] = {"iou": {}, "fscore": {}, "cd": {}}
-    by_gt: dict[str, dict[int, float]] = {"iou": {}, "fscore": {}, "cd": {}}
+    by_pred: dict[str, dict[int, float]] = {
+        metric: {} for metric in PART_GEOMETRY_METRICS
+    }
+    by_gt: dict[str, dict[int, float]] = {
+        metric: {} for metric in PART_GEOMETRY_METRICS
+    }
     for pred_id, gt_id in pairs:
         points = point_metrics(
             pred_points[pred_id], gt_points[gt_id], threshold, workers=workers
         )
-        iou = voxel_iou(pred_voxels[pred_id], gt_voxels[gt_id])
-        values = {"iou": iou, "fscore": points["fscore"], "cd": points["cd"]}
+        values = {
+            "iou_surface": voxel_iou(
+                pred_surface_voxels[pred_id], gt_surface_voxels[gt_id]
+            ),
+            "iou_volume": voxel_iou(
+                pred_volume_voxels[pred_id], gt_volume_voxels[gt_id]
+            ),
+            "fscore": points["fscore"],
+            "cd": points["cd"],
+        }
         pair_results.append(
             {
                 "pred_part_id": pred_id,
@@ -563,10 +634,15 @@ def evaluate_part_geometry(
             by_pred[metric][pred_id] = value
             by_gt[metric][gt_id] = value
 
-    missing = {"iou": 0.0, "fscore": 0.0, "cd": missing_cd_penalty}
+    missing = {
+        "iou_surface": 0.0,
+        "iou_volume": 0.0,
+        "fscore": 0.0,
+        "cd": missing_cd_penalty,
+    }
     penalized: dict[str, float] = {}
     matched_only: dict[str, float | None] = {}
-    for metric in ("iou", "fscore", "cd"):
+    for metric in PART_GEOMETRY_METRICS:
         forward = directional_part_average(
             pred_points.keys(), by_pred[metric], missing[metric]
         )
@@ -678,7 +754,12 @@ def evaluate_object(
     pairs, cost = match_parts(
         pred_points, gt_points, args.matching_points, args.kd_workers
     )
-    gt_voxels, gt_whole_voxels = surface_voxels(
+    (
+        gt_surface_voxels,
+        gt_whole_surface_voxels,
+        gt_volume_voxels,
+        gt_whole_volume_voxels,
+    ) = voxelize_surface_and_volume(
         gt_mesh,
         gt_labels,
         args.voxel_resolution,
@@ -686,7 +767,12 @@ def evaluate_object(
         args.domain_max,
         args.dense_vertex_face_threshold,
     )
-    pred_voxels, pred_whole_voxels = surface_voxels(
+    (
+        pred_surface_voxels,
+        pred_whole_surface_voxels,
+        pred_volume_voxels,
+        pred_whole_volume_voxels,
+    ) = voxelize_surface_and_volume(
         pred_mesh,
         pred_labels,
         args.voxel_resolution,
@@ -697,8 +783,10 @@ def evaluate_object(
     parts, pair_results = evaluate_part_geometry(
         pred_points,
         gt_points,
-        pred_voxels,
-        gt_voxels,
+        pred_surface_voxels,
+        gt_surface_voxels,
+        pred_volume_voxels,
+        gt_volume_voxels,
         pairs,
         args.fscore_threshold,
         args.missing_cd_penalty,
@@ -711,13 +799,19 @@ def evaluate_object(
         workers=args.kd_workers,
     )
     whole = {
-        "iou": voxel_iou(pred_whole_voxels, gt_whole_voxels),
+        "iou_surface": voxel_iou(
+            pred_whole_surface_voxels, gt_whole_surface_voxels
+        ),
+        "iou_volume": voxel_iou(
+            pred_whole_volume_voxels, gt_whole_volume_voxels
+        ),
         "fscore": whole_points["fscore"],
         "cd": whole_points["cd"],
         "precision": whole_points["precision"],
         "recall": whole_points["recall"],
     }
     return {
+        "protocol_version": PROTOCOL_VERSION,
         "sample_id": sample_id,
         "method": method,
         "counts": {
@@ -726,8 +820,10 @@ def evaluate_object(
             "matched_parts": len(pairs),
             "pred_faces": len(pred_mesh.faces),
             "gt_faces": len(gt_mesh.faces),
-            "pred_surface_voxels": len(pred_whole_voxels),
-            "gt_surface_voxels": len(gt_whole_voxels),
+            "pred_surface_voxels": len(pred_whole_surface_voxels),
+            "gt_surface_voxels": len(gt_whole_surface_voxels),
+            "pred_volume_voxels": len(pred_whole_volume_voxels),
+            "gt_volume_voxels": len(gt_whole_volume_voxels),
         },
         "matching": {
             "pairs": pair_results,
@@ -765,13 +861,13 @@ def summarize(
                     if result["geometry"]["parts"][variant][metric] is not None
                 ]
             )
-            for metric in ("iou", "fscore", "cd")
+            for metric in PART_GEOMETRY_METRICS
         }
     geometry["whole"] = {
         metric: scalar_summary(
             [result["geometry"]["whole"][metric] for result in object_results]
         )
-        for metric in ("iou", "fscore", "cd")
+        for metric in WHOLE_GEOMETRY_METRICS
     }
     joint_records = [
         record
@@ -840,6 +936,16 @@ def discover_ids(args: argparse.Namespace) -> list[str]:
     return available
 
 
+def cache_is_compatible(
+    result: dict[str, Any], sample_id: str, method: str
+) -> bool:
+    return (
+        result.get("protocol_version") == PROTOCOL_VERSION
+        and result.get("sample_id") == sample_id
+        and result.get("method") == method
+    )
+
+
 def main() -> None:
     args = parse_args()
     ids = discover_ids(args)
@@ -848,8 +954,11 @@ def main() -> None:
     print(f"Evaluating {args.method} on {len(ids)} objects", flush=True)
     for index, sample_id in enumerate(ids, start=1):
         output_path = object_dir / f"{sample_id}.json"
+        use_cache = False
         if args.resume and output_path.is_file():
             result = json.loads(output_path.read_text(encoding="utf-8"))
+            use_cache = cache_is_compatible(result, sample_id, args.method)
+        if use_cache:
             status = "cached"
         else:
             result = evaluate_object(
@@ -867,7 +976,7 @@ def main() -> None:
 
     metadata = {
         "protocol_name": "URDF-Anything+ metric family / local operationalization",
-        "protocol_version": "comparison-local-v2",
+        "protocol_version": PROTOCOL_VERSION,
         "official_evaluation_code_available": False,
         "paper_defined_components": {
             "iou": "intersection over union of shape volume / occupied voxels",
@@ -880,15 +989,29 @@ def main() -> None:
             "aggregation, and conditional joint scope are not specified by the paper"
         ),
         "coordinate_domain": [args.domain_min, args.domain_max],
-        "urdf_prediction_coordinate": args.urdf_coordinate,
+        "prediction_coordinate": (
+            f"generated URDF {args.urdf_coordinate} coordinates"
+            if args.method == "urdf-anything-plus"
+            else "Particulate eval export coordinates"
+        ),
         "normalization": "object coordinates scaled to approximately [-1, 1]^3",
         "voxel_iou": {
-            "definition": "intersection/union of occupied surface voxels",
             "resolution": args.voxel_resolution,
             "ray_samples_per_voxel_cross_section": 1,
-            "rasterization": "dense mesh vertices at or above face threshold; tri-axial center rays otherwise",
+            "surface_rasterization": "dense mesh vertices at or above face threshold; tri-axial center rays otherwise",
             "dense_vertex_face_threshold": args.dense_vertex_face_threshold,
-            "solid_fill": False,
+            "variants": {
+                "iou_surface": {
+                    "definition": "intersection/union of occupied surface voxels",
+                    "solid_fill": False,
+                },
+                "iou_volume": {
+                    "definition": "intersection/union of occupied solid volume voxels",
+                    "solid_fill": True,
+                    "volume_fill": "orthographic: bounded by surface voxels in both directions on all three axes",
+                    "paper_primary": True,
+                },
+            },
         },
         "fscore_threshold": args.fscore_threshold,
         "chamfer": "bidirectional mean squared L2; two directional means are summed",
@@ -906,7 +1029,8 @@ def main() -> None:
             "local missing-part stress test; not an official or primary paper metric"
         ),
         "unmatched_part_values": {
-            "iou": 0.0,
+            "iou_surface": 0.0,
+            "iou_volume": 0.0,
             "fscore": 0.0,
             "cd": args.missing_cd_penalty,
         },
