@@ -13,6 +13,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--samples", type=int, default=16)
     return parser.parse_args(sys.argv[sys.argv.index("--") + 1 :])
 
 
@@ -61,6 +62,7 @@ def main():
 
     scene = bpy.context.scene
     scene.render.engine = "BLENDER_EEVEE"
+    scene.eevee.taa_render_samples = args.samples
     scene.eevee.use_gtao = True
     scene.eevee.gtao_distance = 3.0
     scene.eevee.gtao_factor = 1.2

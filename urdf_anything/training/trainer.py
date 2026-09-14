@@ -589,6 +589,9 @@ class DiTTrainer:
                 val_motion_type_loss,
             ) = self.validate(val_loader)
 
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+
             if self.rank == 0:
                 print(
                     f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}, "

@@ -28,23 +28,20 @@ cd /data1/LiuShuqi/code/articulation/baselines/URDF-Anything-plus
 
 主要已验证版本为 Python 3.10.21、PyTorch 2.6.0+cu124、torchvision 0.21.0+cu124、torch-cluster 1.6.3+pt26cu124、diso 0.1.4、diffusers 0.35.1、transformers 4.57.2 和 trimesh 4.7.4。
 
-### NVIDIA 用户态/内核版本不一致时的局部兼容方式
+### NVIDIA 驱动检查
 
-2026-09-11 的 unattended upgrade 将用户态 NVIDIA 库从 `580.173.02`
-更新到 `580.178.04`，但运行中的内核模块仍为 `580.173.02`。无需覆盖
-系统文件，可将 Ubuntu 官方旧版 `libnvidia-compute-580` 解压到本工作输出：
+2026-09-14 已确认内核模块和系统用户态库均为 `580.178.04`，8 张 RTX 4090
+可正常使用。不要再设置旧的 `580.173.02` `LD_LIBRARY_PATH`，否则会主动制造
+driver/library mismatch。新服务器先运行：
 
 ```bash
-export URDF_ANYTHING_DRIVER_COMPAT=/data2/LiuShuqi/output/URDF-Anything-plus/driver-compat/580.173.02/root/usr/lib/x86_64-linux-gnu
-env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT nvidia-smi
+cat /proc/driver/nvidia/version
+readlink -f /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+nvidia-smi
 ```
 
-本地包为
-`driver-compat/580.173.02/packages/libnvidia-compute-580_580.173.02-0ubuntu0.22.04.1_amd64.deb`，
-SHA-256 为
-`01327514a8fde543dc092b79016f92a51dc7d72aa59db193c2405bde7d371503`。
-运行 PyTorch 或推理时同样在命令前加
-`env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT`；这只影响该子进程。
+若前两项版本不一致，先重启使已安装内核模块生效；不要长期依赖工作目录中的
+旧驱动库覆盖系统库。
 
 TripoSG 的完整 VAE 编码器需要启用 `torch_cluster.fps`，克隆或更新 TripoSG 后运行以下幂等脚本：
 
@@ -62,15 +59,8 @@ export HF_HOME=$URDF_ANYTHING_OUTPUT/huggingface
 export PIP_CACHE_DIR=$URDF_ANYTHING_OUTPUT/cache/pip
 export TORCH_HOME=$URDF_ANYTHING_OUTPUT/cache/torch
 export URDF_ANYTHING_TRIPOSG_VAE_PATH=$URDF_ANYTHING_OUTPUT/checkpoints/triposg/vae
-export URDF_ANYTHING_DRIVER_COMPAT=$URDF_ANYTHING_OUTPUT/driver-compat/580.173.02/root/usr/lib/x86_64-linux-gnu
 export PYTHONPATH=$URDF_ANYTHING_ROOT/TripoSG:$URDF_ANYTHING_ROOT
 ```
-
-在当前内核仍为 `580.173.02` 时，所有 CUDA 命令均应使用
-`env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT` 前缀；不要回退到当前系统的
-`/usr/lib/x86_64-linux-gnu`，其中的 `580.178.04` 用户态库会再次触发
-driver/library version mismatch。机器重启并确认内核模块升级后，才应重新检查是否
-还需要该兼容前缀。
 
 ## 模型权重
 
@@ -127,7 +117,6 @@ python scripts/validate_partnet_inputs.py \
 完成 DINOv3 校验后，先在当时空闲的 GPU 上运行两部件样本 `12252`：
 
 ```bash
-env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT \
 CUDA_VISIBLE_DEVICES=7 python scripts/inference_partnet.py \
   --input-root $URDF_ANYTHING_DATA/test \
   --output-root $URDF_ANYTHING_OUTPUT/inference/PartNetMobility-test \
@@ -144,7 +133,6 @@ CUDA_VISIBLE_DEVICES=7 python scripts/inference_partnet.py \
 单样本成功后运行全部 77 个对象，`--resume` 会跳过已有 `complete.json` 的样本：
 
 ```bash
-env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT \
 CUDA_VISIBLE_DEVICES=7 python scripts/inference_partnet.py \
   --input-root $URDF_ANYTHING_DATA/test \
   --output-root $URDF_ANYTHING_OUTPUT/inference/PartNetMobility-test \
@@ -173,7 +161,6 @@ python comparison/prepare_orientation_probe.py \
 全量运行将 ID 列表分为四组并行放在 GPU 4--7：
 
 ```bash
-env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT \
 CUDA_VISIBLE_DEVICES=7 python scripts/inference_partnet.py \
   --input-root /data2/LiuShuqi/data/processed/PartNetMobility_URDF-Anything-plus-orientation-probe/test \
   --output-root $URDF_ANYTHING_OUTPUT/inference/PartNetMobility-test-oriented \
@@ -194,7 +181,6 @@ CUDA_VISIBLE_DEVICES=7 python scripts/inference_partnet.py \
 ```bash
 conda activate /home/LiuShuqi/.conda/envs/particulate
 cd /data1/LiuShuqi/code/articulation/baselines/particulate
-env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT \
 CUDA_VISIBLE_DEVICES=7 python evaluate.py \
   --gt_dir /data2/LiuShuqi/data/processed/PartNetMobility_URDF-Anything-plus/gt \
   --result_dir /data2/LiuShuqi/output/URDF-Anything-plus/inference/PartNetMobility-test \
@@ -219,7 +205,6 @@ part occupancy 的并集。论文对比固定使用 volume IoU。每个对象 JS
 ```bash
 conda activate /home/LiuShuqi/.conda/envs/particulate
 cd $URDF_ANYTHING_ROOT
-env LD_LIBRARY_PATH=$URDF_ANYTHING_DRIVER_COMPAT \
 python -m comparison.evaluate_author_metrics \
   --method urdf-anything-plus \
   --prediction-root $URDF_ANYTHING_OUTPUT/inference/PartNetMobility-test-oriented \

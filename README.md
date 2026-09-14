@@ -50,7 +50,7 @@
 
 4. **Install dependencies**：
    ```bash
-   pip install -r  -u requirements.txt -i https://pypi.org/simple/
+   pip install -U -r requirements.txt -i https://pypi.org/simple/
    ```
 
 5. **Install torch-cluster**。Must be installed after PyTorch:
@@ -104,6 +104,11 @@ snapshot_download(repo_id='facebook/dinov3-vith16plus-pretrain-lvd1689m', local_
 **Important: There is a little problem with TripoSG/triposg/models/autoencoders/autoencoder_kl_triposg.py, you need to uncomment the line 15 `from torch_cluster import fps`.**
 
 ## Training
+
+For a concise end-to-end reproduction covering environment setup, author data,
+single-sample training, inference, evaluation, and visualization, see
+[`REPRODUCE.md`](REPRODUCE.md).
+
 ### Data Preparation
 Download the dataset from [Hugging Face](https://huggingface.co/datasets/URDF-Anything-plus/Dataset) and unzip it to `data_normalized/`.
 

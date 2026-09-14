@@ -37,9 +37,12 @@ class URDFModel(nn.Module):
         load_3d_model = init_mode == "inference"
         load_dit_pretrained = init_mode == "train_from_scratch"
         dit_config = self.config["ditrunner"].copy()
-        dit_pretrained_path = self.config.get(
-            "dit_pretrained_path",
-            "TripoSG/transformer/diffusion_pytorch_model.safetensors",
+        dit_pretrained_path = os.environ.get(
+            "URDF_ANYTHING_TRIPOSG_DIT_PATH",
+            self.config.get(
+                "dit_pretrained_path",
+                "TripoSG/transformer/diffusion_pytorch_model.safetensors",
+            ),
         )
         self.DiTRunner = DiTRunner(
             dit_config,

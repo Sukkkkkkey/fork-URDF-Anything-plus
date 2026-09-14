@@ -127,7 +127,14 @@ def build_eot_item(info_data, encode_whole):
     }
 
 
-def save_cache_data_for_dataset(data_root, cache_name, token_length, train_test_split_path=None):
+def save_cache_data_for_dataset(
+    data_root,
+    cache_name,
+    token_length,
+    train_test_split_path=None,
+    allow_single_object_overlap=False,
+    random_seed=42,
+):
     global device, dtype, cache_dir, dino_processor, dino_model, vae
     print(f"\nBegin to save cache for dataset: {data_root}")
     print(f"Cache name: {cache_name}")
@@ -226,8 +233,14 @@ def save_cache_data_for_dataset(data_root, cache_name, token_length, train_test_
             failed_items.append({"id": obj_id, "reason": str(e)})
             continue
 
+    if not all_data:
+        raise RuntimeError(
+            f"No cache samples were built for {data_root}; failures={failed_items}"
+        )
+
     print("\nsplit train/test (by object)...")
     if train_test_split_path and os.path.isfile(train_test_split_path):
+        split_method = "split_file_by_object"
         with open(train_test_split_path, "r", encoding="utf-8") as f:
             split_data = json.load(f)
         train_obj_ids = set(str(x) for x in split_data.get("train", []))
@@ -240,14 +253,20 @@ def save_cache_data_for_dataset(data_root, cache_name, token_length, train_test_
         train_data = [d for d in all_data if str(d["obj_id"]) in train_obj_ids]
         test_data = [d for d in all_data if str(d["obj_id"]) in test_obj_ids]
     else:
-        random.seed(42)
+        random.seed(random_seed)
         unique_obj_ids = sorted(set(str(d["obj_id"]) for d in all_data))
         shuffled_obj_ids = unique_obj_ids.copy()
         random.shuffle(shuffled_obj_ids)
         total_obj_count = len(shuffled_obj_ids)
-        train_obj_count = int(total_obj_count * 0.9)
-        train_obj_ids = set(shuffled_obj_ids[:train_obj_count])
-        test_obj_ids = set(shuffled_obj_ids[train_obj_count:])
+        if total_obj_count == 1 and allow_single_object_overlap:
+            split_method = "single_object_smoke_overlap"
+            train_obj_ids = set(shuffled_obj_ids)
+            test_obj_ids = set(shuffled_obj_ids)
+        else:
+            split_method = "random_by_object"
+            train_obj_count = int(total_obj_count * 0.9)
+            train_obj_ids = set(shuffled_obj_ids[:train_obj_count])
+            test_obj_ids = set(shuffled_obj_ids[train_obj_count:])
         train_data = [d for d in all_data if str(d["obj_id"]) in train_obj_ids]
         test_data = [d for d in all_data if str(d["obj_id"]) in test_obj_ids]
     torch.save(train_data, os.path.join(current_cache_dir, "train_data.pt"))
@@ -262,13 +281,21 @@ def save_cache_data_for_dataset(data_root, cache_name, token_length, train_test_
         "test_objects": len(test_obj_ids),
         "train_samples": len(train_data),
         "test_samples": len(test_data),
-        "train_ratio": 0.9,
-        "test_ratio": 0.1,
-        "split_method": "by_object",
+        "train_ratio": (
+            len(train_obj_ids) / len(set(str(d["obj_id"]) for d in all_data))
+            if all_data
+            else 0.0
+        ),
+        "test_ratio": (
+            len(test_obj_ids) / len(set(str(d["obj_id"]) for d in all_data))
+            if all_data
+            else 0.0
+        ),
+        "split_method": split_method,
         "failed_items": failed_items,
         "device": device,
         "dtype": str(dtype),
-        "random_seed": 42,
+        "random_seed": random_seed,
         "timestamp": datetime.now().isoformat(),
     }
     with open(
@@ -288,47 +315,128 @@ def save_cache_data_for_dataset(data_root, cache_name, token_length, train_test_
 def main():
     """CLI entry: parse args, load VAE/DINO, run save_cache_data_for_dataset on configured datasets."""
     global device, dtype, cache_dir, dino_processor, dino_model, vae
-    triposg_weights_dir = "TripoSG/pretrained_weights/TripoSG/vae"
-    device = "cuda"
-    dtype = torch.float16
     parser = argparse.ArgumentParser()
     parser.add_argument("--token_length", type=int, default=512)
     parser.add_argument("--dino_model_path", type=str, default="DINOv3")
     parser.add_argument("--cache_dir", type=str, default="cache")
     parser.add_argument(
+        "--triposg_vae_path",
+        type=str,
+        default=os.environ.get(
+            "URDF_ANYTHING_TRIPOSG_VAE_PATH",
+            "TripoSG/pretrained_weights/TripoSG",
+        ),
+        help="TripoSG root containing vae/ or the VAE directory itself",
+    )
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16", "float32"],
+        default="float16",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default=None,
+        help="Build one explicitly selected dataset root instead of all default categories",
+    )
+    parser.add_argument(
+        "--data_normalized_root",
+        type=str,
+        default="data_normalized",
+        help="Root containing all default *_urdf category directories",
+    )
+    parser.add_argument(
+        "--cache_name",
+        type=str,
+        default=None,
+        help="Cache name used with --data_root (defaults to the data directory name)",
+    )
+    parser.add_argument(
+        "--allow_single_object_overlap",
+        action="store_true",
+        help="Use the same sole object for train and validation in a smoke test",
+    )
+    parser.add_argument(
         "--train_test_split",
         type=str,
-        default='data_normalized/train_test_split.json',
+        default=None,
+        help="Object split JSON (defaults to <data_normalized_root>/train_test_split.json for full data)",
     )
     args = parser.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    device = args.device
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[args.dtype]
     token_length = args.token_length
+    vae_kwargs = {"local_files_only": True}
+    if os.path.isfile(os.path.join(args.triposg_vae_path, "config.json")):
+        pass
+    elif os.path.isfile(
+        os.path.join(args.triposg_vae_path, "vae", "config.json")
+    ):
+        vae_kwargs["subfolder"] = "vae"
+    else:
+        raise FileNotFoundError(
+            "Cannot find TripoSG VAE config.json under "
+            f"{args.triposg_vae_path}"
+        )
     vae = TripoSGVAEModel.from_pretrained(
-        triposg_weights_dir,
-        subfolder="vae",
+        args.triposg_vae_path,
+        **vae_kwargs,
     ).to(device, dtype=dtype)
-    dino_processor = AutoImageProcessor.from_pretrained(args.dino_model_path)
-    dino_model = AutoModel.from_pretrained(args.dino_model_path).to(device)
+    vae.eval()
+    dino_processor = AutoImageProcessor.from_pretrained(
+        args.dino_model_path, local_files_only=True
+    )
+    dino_model = AutoModel.from_pretrained(
+        args.dino_model_path, local_files_only=True
+    ).to(device)
+    dino_model.eval()
     cache_dir = args.cache_dir
     os.makedirs(cache_dir, exist_ok=True)
-    datasets = [
-        {"data_root": "data_normalized/Laptop_urdf", "cache_name": "laptop_eot"},
-        {"data_root": "data_normalized/Refrigerator_urdf", "cache_name": "refrigerator_eot"},
-        {"data_root": "data_normalized/Dishwasher_urdf", "cache_name": "dishwasher_eot"},
-        {"data_root": "data_normalized/Microwave_urdf", "cache_name": "microwave_eot"},
-        {"data_root": "data_normalized/Faucet_urdf", "cache_name": "faucet_eot"},
-        {"data_root": "data_normalized/Display_urdf", "cache_name": "display_eot"},
-        {"data_root": "data_normalized/Door_urdf", "cache_name": "door_eot"},
-        {"data_root": "data_normalized/Knife_urdf", "cache_name": "knife_eot"},
-        {"data_root": "data_normalized/Scissors_urdf", "cache_name": "scissors_eot"},
-        {"data_root": "data_normalized/StorageFurniture_urdf", "cache_name": "storagefurniture_eot"},
-    ]
+    if args.data_root:
+        train_test_split_path = args.train_test_split
+        datasets = [
+            {
+                "data_root": args.data_root,
+                "cache_name": args.cache_name
+                or f"{os.path.basename(os.path.normpath(args.data_root)).lower()}_eot",
+            }
+        ]
+    else:
+        train_test_split_path = args.train_test_split or os.path.join(
+            args.data_normalized_root, "train_test_split.json"
+        )
+        datasets = [
+            {"data_root": os.path.join(args.data_normalized_root, "Laptop_urdf"), "cache_name": "laptop_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Refrigerator_urdf"), "cache_name": "refrigerator_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Dishwasher_urdf"), "cache_name": "dishwasher_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Microwave_urdf"), "cache_name": "microwave_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Faucet_urdf"), "cache_name": "faucet_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Display_urdf"), "cache_name": "display_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Door_urdf"), "cache_name": "door_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Knife_urdf"), "cache_name": "knife_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "Scissors_urdf"), "cache_name": "scissors_eot"},
+            {"data_root": os.path.join(args.data_normalized_root, "StorageFurniture_urdf"), "cache_name": "storagefurniture_eot"},
+        ]
+    successful_datasets = 0
     for dataset_config in datasets:
         try:
             cache_path, all_data, train_data, test_data, metadata = save_cache_data_for_dataset(
                 dataset_config["data_root"],
                 dataset_config["cache_name"] + f"_token{token_length}",
                 token_length,
-                train_test_split_path=args.train_test_split,
+                train_test_split_path=train_test_split_path,
+                allow_single_object_overlap=args.allow_single_object_overlap,
+                random_seed=args.seed,
             )
             print(f"\n{'='*60}")
             print(f"dataset: {dataset_config['data_root']}")
@@ -339,8 +447,11 @@ def main():
             if metadata.get("failed_items"):
                 print(f"failed items: {len(metadata['failed_items'])}")
             print(f"{'='*60}\n")
+            successful_datasets += 1
         except Exception as e:
             print(f"\nerror processing dataset {dataset_config['data_root']}: {e}")
             import traceback
             traceback.print_exc()
             continue
+    if successful_datasets == 0:
+        raise RuntimeError("Cache building failed for every selected dataset")

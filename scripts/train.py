@@ -4,6 +4,7 @@ Run from repo root (codes/):  python scripts/train.py ...
 """
 import os
 import sys
+import random
 
 # Ensure repo root (codes/) is on path when running as scripts/train.py
 _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -12,6 +13,8 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 import argparse
+import numpy as np
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -111,12 +114,29 @@ def main():
         default="False",
         help="Whether to save optimizer state in checkpoint",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable best-effort deterministic CUDA behavior",
+    )
 
     args = parser.parse_args()
 
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     rank, world_size, local_rank = setup_distributed()
-    import torch
     device = f"cuda:{local_rank}" if world_size > 1 else "cuda"
+    process_seed = args.seed + rank
+    random.seed(process_seed)
+    np.random.seed(process_seed)
+    torch.manual_seed(process_seed)
+    torch.cuda.manual_seed_all(process_seed)
+    if args.deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     training_config = {
         "model_config_path": args.model_config_path,
@@ -135,6 +155,8 @@ def main():
         "urdf_loss_timestep_ratio": args.urdf_loss_timestep_ratio,
         "save_optimizer": args.save_optimizer == "True",
         "use_wandb": args.use_wandb == "True",
+        "seed": args.seed,
+        "deterministic": args.deterministic,
     }
 
     if local_rank == 0:
@@ -179,9 +201,18 @@ def main():
 
     if world_size > 1:
         train_sampler = DistributedSampler(
-            train_dataset, num_replicas=world_size, rank=rank
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            seed=args.seed,
         )
-        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False,
+            seed=args.seed,
+        )
     else:
         train_sampler = None
         val_sampler = None
@@ -194,6 +225,7 @@ def main():
         num_workers=0,
         collate_fn=collate_fn,
         pin_memory=False,
+        generator=torch.Generator().manual_seed(process_seed),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -203,6 +235,7 @@ def main():
         num_workers=0,
         collate_fn=collate_fn,
         pin_memory=False,
+        generator=torch.Generator().manual_seed(process_seed),
     )
 
     trainer = DiTTrainer(
