@@ -19,7 +19,12 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from urdf_anything.data import load_cache_data
-from urdf_anything.data import CachedDataset, collate_fn
+from urdf_anything.data import (
+    CachedDataset,
+    CachedSetDataset,
+    collate_fn,
+    set_collate_fn,
+)
 from urdf_anything.training import setup_distributed, cleanup_distributed, DiTTrainer
 
 
@@ -95,6 +100,18 @@ def main():
         help="Autoregressive history condition ablation",
     )
     parser.add_argument(
+        "--generation_mode",
+        choices=["autoregressive", "set"],
+        default="autoregressive",
+        help="Part generation architecture ablation",
+    )
+    parser.add_argument(
+        "--num_part_slots",
+        type=int,
+        default=5,
+        help="Fixed number of slots used by generation_mode=set",
+    )
+    parser.add_argument(
         "--urdf_loss_timestep_ratio",
         type=float,
         default=0.3,
@@ -128,6 +145,13 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.num_part_slots < 1:
+        parser.error("--num_part_slots must be at least 1")
+    if args.generation_mode == "set" and args.history_mode != "geometry":
+        parser.error("set mode is an independent geometry-only ablation")
+    if args.generation_mode == "set" and args.train_eot == "True":
+        parser.error("set mode uses presence supervision instead of EOT")
 
     if args.deterministic:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -164,6 +188,8 @@ def main():
         "seed": args.seed,
         "deterministic": args.deterministic,
         "history_mode": args.history_mode,
+        "generation_mode": args.generation_mode,
+        "num_part_slots": args.num_part_slots,
     }
 
     if local_rank == 0:
@@ -199,12 +225,28 @@ def main():
         print(f"  Datasets: {list(data_root_map.keys())}")
 
     train_eot = training_config.get("train_eot", False)
-    train_dataset = CachedDataset(
-        all_train_data, data_root_map, split="train", train_eot=train_eot
-    )
-    val_dataset = CachedDataset(
-        all_test_data, data_root_map, split="test", train_eot=train_eot
-    )
+    if training_config["generation_mode"] == "set":
+        train_dataset = CachedSetDataset(
+            all_train_data,
+            data_root_map,
+            split="train",
+            num_part_slots=training_config["num_part_slots"],
+        )
+        val_dataset = CachedSetDataset(
+            all_test_data,
+            data_root_map,
+            split="test",
+            num_part_slots=training_config["num_part_slots"],
+        )
+        selected_collate_fn = set_collate_fn
+    else:
+        train_dataset = CachedDataset(
+            all_train_data, data_root_map, split="train", train_eot=train_eot
+        )
+        val_dataset = CachedDataset(
+            all_test_data, data_root_map, split="test", train_eot=train_eot
+        )
+        selected_collate_fn = collate_fn
 
     if world_size > 1:
         train_sampler = DistributedSampler(
@@ -230,7 +272,7 @@ def main():
         shuffle=(train_sampler is None),
         sampler=train_sampler,
         num_workers=0,
-        collate_fn=collate_fn,
+        collate_fn=selected_collate_fn,
         pin_memory=False,
         generator=torch.Generator().manual_seed(process_seed),
     )
@@ -240,7 +282,7 @@ def main():
         shuffle=False,
         sampler=val_sampler,
         num_workers=0,
-        collate_fn=collate_fn,
+        collate_fn=selected_collate_fn,
         pin_memory=False,
         generator=torch.Generator().manual_seed(process_seed),
     )

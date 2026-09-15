@@ -32,6 +32,8 @@ class DiTRunner(nn.Module):
             motion_history_hidden_dim=config.get(
                 "motion_history_hidden_dim", 256
             ),
+            generation_mode=config.get("generation_mode", "autoregressive"),
+            num_part_slots=config.get("num_part_slots", 5),
         ).to(device)
 
         if load_dit_pretrained:
@@ -70,6 +72,8 @@ class DiTRunner(nn.Module):
         self.num_train_timesteps = noise_scheduler_config["num_train_timesteps"]
         self.num_inference_timesteps = noise_scheduler_config["num_inference_timesteps"]
         self.prediction_type = noise_scheduler_config["prediction_type"]
+        self.generation_mode = config.get("generation_mode", "autoregressive")
+        self.num_part_slots = int(config.get("num_part_slots", 5))
 
     def conditional_sample(self, cond, generator: torch.Generator | None = None):
         noisy_latents = torch.randn(
@@ -148,4 +152,61 @@ class DiTRunner(nn.Module):
             "param2": noisy_param2,
             "param3": noisy_param3,
             "motion_type": motion_type_final,
+        }
+
+    def conditional_sample_set(self, cond, generator: torch.Generator | None = None):
+        """Denoise all fixed part slots together without inter-slot attention."""
+        if self.generation_mode != "set":
+            raise ValueError("conditional_sample_set requires generation_mode=set")
+        batch_size, seq_length, latent_dim = cond["encode_whole"].shape
+        device = cond["encode_whole"].device
+        noisy_latents = torch.randn(
+            batch_size,
+            self.num_part_slots,
+            seq_length,
+            latent_dim,
+            device=device,
+            generator=generator,
+        )
+        noisy_latents = noisy_latents.flatten(0, 1)
+        dino = cond["dino"].repeat_interleave(self.num_part_slots, dim=0)
+        encode_whole = cond["encode_whole"].repeat_interleave(
+            self.num_part_slots, dim=0
+        )
+        self.noise_scheduler.set_timesteps(
+            self.num_inference_timesteps, device=device
+        )
+        model_output = None
+        for timestep in tqdm(self.noise_scheduler.timesteps, desc="Sampling set"):
+            timestep = timestep.to(device=device)
+            if timestep.dim() == 0:
+                timestep = timestep.unsqueeze(0)
+            model_timesteps = timestep.expand(batch_size * self.num_part_slots)
+            model_output = self.model(
+                hidden_states=noisy_latents,
+                timestep=model_timesteps,
+                encoder_hidden_states=dino,
+                encoder_hidden_states_2=encode_whole,
+            )
+            timestep_int = int(timestep.flatten()[0].item())
+            noisy_latents = self.noise_scheduler.step(
+                model_output["latent"], timestep_int, noisy_latents
+            ).prev_sample
+
+        if model_output is None:
+            raise RuntimeError("set sampler has no inference timesteps")
+
+        def reshape_slots(value):
+            return value.reshape(batch_size, self.num_part_slots, *value.shape[1:])
+
+        return {
+            "latent": noisy_latents.reshape(
+                batch_size, self.num_part_slots, seq_length, latent_dim
+            ),
+            "param1": reshape_slots(model_output["param1"]),
+            "param2": reshape_slots(model_output["param2"]),
+            "param3": reshape_slots(model_output["param3"]),
+            "motion_type": reshape_slots(model_output["motion_type"]),
+            "presence": reshape_slots(model_output["presence"]),
+            "part_order": reshape_slots(model_output["part_order"]),
         }

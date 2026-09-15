@@ -49,13 +49,20 @@ def main():
     parser.add_argument(
         "--model_config_path",
         type=str,
-        default="urdf_anything/model/URDFModel_config.yaml",
+        default=None,
+        help="Optional config override; by default use config embedded in checkpoint",
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--num_tokens", type=int, default=512)
     parser.add_argument("--triposg_weights_dir", type=str, default=None)
     parser.add_argument("--rmbg_weights_dir", type=str, default=None)
     parser.add_argument("--eot_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--presence_threshold",
+        type=float,
+        default=0.5,
+        help="Slot presence threshold for simultaneous set checkpoints",
+    )
     parser.add_argument("--max_reconstruction_attempts", type=int, default=3)
     parser.add_argument("--max_links", type=int, default=16)
     parser.add_argument("--overlap_chamfer_threshold", type=float, default=3e-2)
@@ -132,6 +139,7 @@ def main():
         max_links=args.max_links,
         seed=args.seed,
         vae_deterministic=args.vae_deterministic,
+        presence_threshold=args.presence_threshold,
     )
 
     if args.in_the_wild:

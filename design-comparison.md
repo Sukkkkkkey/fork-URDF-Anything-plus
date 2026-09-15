@@ -127,7 +127,7 @@ L_geometry_real
 训练，但 padding 不参与 part-order；motion 参数仅真实、非 root 且 `t < 300` 的槽
 参与。presence 使用全部 5 slots。
 
-预定 smoke 命令（实现完成后以实际 CLI 为准）：
+已验证 smoke 命令：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 "$ENV_PREFIX/bin/python" -u scripts/train.py \
@@ -141,11 +141,29 @@ CUDA_VISIBLE_DEVICES=0 "$ENV_PREFIX/bin/python" -u scripts/train.py \
   --seed 42 --deterministic
 ```
 
+2026-09-15 实测：一个 batch 为 3 real + 2 padding slots，训练日志确认
+`generation_mode=set` 和 `gradient_checkpointing=True`。一轮训练完成，
+`Train Loss=0.906143`、`Val Loss=0.983762`；validation 的分项为：
+
+```text
+presence              0.698387
+part order            1.630387
+geometry real         0.957616
+geometry padding      0.028583
+```
+
+日志和 checkpoint 分别为：
+
+```text
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/set-denoising-train.log
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/set-denoising/lr1e-5_bs1_ep1_urdf-params_set5/epoch_1.pth
+```
+
 ## 执行与验收状态
 
 - [x] 对比 1：代码和单元测试
 - [x] 对比 1：Microwave `7201` 一 epoch 最小训练
 - [x] 对比 1：更新 `REPRODUCE.md` 并提交 `add motion-aware autoregressive history`
-- [ ] 对比 2：代码和单元测试
-- [ ] 对比 2：Microwave `7201` 一 epoch 最小训练
-- [ ] 对比 2：更新 `REPRODUCE.md` 并提交 `add simultaneous part set denoising`
+- [x] 对比 2：代码和单元测试
+- [x] 对比 2：Microwave `7201` 一 epoch 最小训练
+- [x] 对比 2：更新 `REPRODUCE.md` 并提交 `add simultaneous part set denoising`

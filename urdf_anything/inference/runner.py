@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import trimesh
 from PIL import Image
 from scipy.spatial import cKDTree
+from scipy.optimize import linear_sum_assignment
 from transformers import AutoImageProcessor, AutoModel
 
 from urdf_anything.model import URDFModel
@@ -15,6 +16,29 @@ from TripoSG.triposg.inference_utils import hierarchical_extract_geometry
 
 from .utils import resize_image_tensor, ensure_watertight
 from .urdf_io import construct_urdf
+
+
+def select_and_order_part_slots(
+    presence_logits: torch.Tensor,
+    part_order_logits: torch.Tensor,
+    presence_threshold: float,
+) -> List[int]:
+    """Filter set slots, then solve a one-to-one contiguous order assignment."""
+    presence_prob = torch.sigmoid(presence_logits)
+    selected_slots = torch.where(presence_prob >= presence_threshold)[0]
+    if selected_slots.numel() == 0:
+        selected_slots = torch.argmax(presence_prob).reshape(1)
+    selected_count = int(selected_slots.numel())
+    order_logits = part_order_logits[selected_slots, :selected_count]
+    assignment_cost = -torch.log_softmax(order_logits, dim=-1)
+    rows, columns = linear_sum_assignment(
+        assignment_cost.detach().cpu().numpy()
+    )
+    return [
+        int(selected_slots[rows[np.where(columns == order)[0][0]]].item())
+        for order in range(selected_count)
+    ]
+
 
 class URDFInference:
     def __init__(
@@ -30,6 +54,7 @@ class URDFInference:
         max_links: int = 16,
         seed: int = 42,
         vae_deterministic: bool = False,
+        presence_threshold: float = 0.5,
     ):
         self.device = device
         self.num_tokens = num_tokens
@@ -41,6 +66,7 @@ class URDFInference:
         self.max_links = int(max_links)
         self.seed = int(seed)
         self.vae_deterministic = bool(vae_deterministic)
+        self.presence_threshold = float(presence_threshold)
 
         print(f"loading model: {model_path}")
         self.model = URDFModel.from_checkpoint(
@@ -53,6 +79,9 @@ class URDFInference:
         self.model = self.model.to(device)
         self.history_mode = self.model.config["ditrunner"].get(
             "history_mode", "geometry"
+        )
+        self.generation_mode = self.model.config["ditrunner"].get(
+            "generation_mode", "autoregressive"
         )
 
         print(f"loading DINO model: {dino_path}")
@@ -343,6 +372,14 @@ class URDFInference:
 
         print("encoding whole mesh...")
         encode_whole = self.mesh_to_encode_whole(mesh)
+        if self.generation_mode == "set":
+            return self._infer_part_set(
+                dino_features,
+                encode_whole,
+                output_dir,
+                save_meshes=save_meshes,
+                save_urdf=save_urdf,
+            )
         print("\ngenerating links...")
         link_idx = 0
         encode_pre = self.model.SoT
@@ -459,4 +496,100 @@ class URDFInference:
             "num_links": len(prev_meshes),
             "results": all_results,
             "output_dir": output_dir,
+        }
+
+    def _decode_set_latent(self, predicted_latent):
+        predicted_latent = predicted_latent.unsqueeze(0)
+        geometric_func = (
+            lambda x, latent=predicted_latent: self.model.model_3d.decode(
+                latent, sampled_points=x
+            ).sample
+        )
+        output_geom = hierarchical_extract_geometry(
+            geometric_func,
+            device=self.device,
+            bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
+            dense_octree_depth=7,
+            hierarchical_octree_depth=8,
+        )
+        meshes = [
+            trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
+            for mesh_v_f in output_geom
+            if mesh_v_f is not None and mesh_v_f[0] is not None
+        ]
+        return ensure_watertight(meshes[0]) if meshes else None
+
+    def _infer_part_set(
+        self,
+        dino_features,
+        encode_whole,
+        output_dir,
+        save_meshes=True,
+        save_urdf=True,
+    ):
+        print("\ndenoising all part slots simultaneously...")
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(self.seed)
+        with torch.no_grad():
+            output = self.model.DiTRunner.conditional_sample_set(
+                {"dino": dino_features, "encode_whole": encode_whole},
+                generator=generator,
+            )
+
+        presence_prob = torch.sigmoid(output["presence"][0])
+        slots_by_order = select_and_order_part_slots(
+            output["presence"][0],
+            output["part_order"][0],
+            self.presence_threshold,
+        )
+
+        all_results = []
+        for slot in slots_by_order:
+            predicted_latent = output["latent"][0, slot]
+            pred_mesh = self._decode_set_latent(predicted_latent)
+            if pred_mesh is None:
+                print(f"  slot {slot} did not decode to a mesh; skipping")
+                continue
+            link_idx = len(all_results)
+            if save_meshes:
+                mesh_path = os.path.join(output_dir, f"link_{link_idx}.obj")
+                pred_mesh.export(mesh_path)
+                print(f"  saving slot {slot} as link {link_idx}: {mesh_path}")
+            all_results.append(
+                {
+                    "link_idx": link_idx,
+                    "slot_idx": slot,
+                    "pred_mesh": pred_mesh,
+                    "predicted_latent": predicted_latent,
+                    "param1": output["param1"][0, slot].cpu(),
+                    "param2": output["param2"][0, slot].cpu(),
+                    "param3": output["param3"][0, slot].cpu(),
+                    "motion_type": output["motion_type"][0, slot].cpu(),
+                    "presence": float(presence_prob[slot].item()),
+                    "is_eot": False,
+                    "eot_mse": float("nan"),
+                }
+            )
+
+        if save_urdf and all_results:
+            urdf_path = os.path.join(output_dir, "generated.urdf")
+            for result in all_results:
+                link_idx = result["link_idx"]
+                construct_urdf(
+                    link_idx=link_idx,
+                    link_name=f"link_{link_idx}",
+                    origin_xyz=result["param1"].numpy(),
+                    axis_xyz=result["param2"].numpy(),
+                    obj_path=f"link_{link_idx}.obj",
+                    urdf_path=urdf_path,
+                    lower_upper_limits=result["param3"].numpy().tolist(),
+                    motion_type=result["motion_type"],
+                )
+            print(f"Generating URDF: {urdf_path}")
+
+        return {
+            "num_links": len(all_results),
+            "results": all_results,
+            "output_dir": output_dir,
+            "selected_slots": slots_by_order,
         }

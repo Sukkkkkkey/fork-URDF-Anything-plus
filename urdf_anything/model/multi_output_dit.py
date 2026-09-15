@@ -22,6 +22,8 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         history_mode: str = "geometry",
         motion_history_dim: int = 10,
         motion_history_hidden_dim: int = 256,
+        generation_mode: str = "autoregressive",
+        num_part_slots: int = 5,
     ):
         super().__init__(
             num_attention_heads=num_attention_heads,
@@ -34,6 +36,10 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         )
         self.additional_output_dims = additional_output_dims
         self.shared_hidden_dim = shared_hidden_dim
+        if generation_mode not in ("autoregressive", "set"):
+            raise ValueError(f"unsupported generation_mode: {generation_mode}")
+        self.generation_mode = generation_mode
+        self.num_part_slots = int(num_part_slots)
         if history_mode not in ("geometry", "geometry_motion"):
             raise ValueError(f"unsupported history_mode: {history_mode}")
         self.history_mode = history_mode
@@ -124,6 +130,27 @@ class MultiOutputDiTModel(TripoSGDiTModel):
             nn.Tanh(),
             nn.Linear(128, 1),
         )
+        if self.generation_mode == "set":
+            self.presence_head = nn.Sequential(
+                nn.Linear(self.shared_hidden_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, 1),
+            )
+            self.presence_attention = nn.Sequential(
+                nn.Linear(self.shared_hidden_dim, 128),
+                nn.Tanh(),
+                nn.Linear(128, 1),
+            )
+            self.part_order_head = nn.Sequential(
+                nn.Linear(self.shared_hidden_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, self.num_part_slots),
+            )
+            self.part_order_attention = nn.Sequential(
+                nn.Linear(self.shared_hidden_dim, 128),
+                nn.Tanh(),
+                nn.Linear(128, 1),
+            )
 
     def forward(
         self,
@@ -210,18 +237,41 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         motion_type_global = (
             self.motion_type_head(shared_features) * motion_type_attention_weights
         ).sum(dim=1)
+        presence_global = None
+        part_order_global = None
+        if self.generation_mode == "set":
+            presence_attention_weights = F.softmax(
+                self.presence_attention(shared_features), dim=1
+            )
+            presence_global = (
+                self.presence_head(shared_features) * presence_attention_weights
+            ).sum(dim=1).squeeze(-1)
+            part_order_attention_weights = F.softmax(
+                self.part_order_attention(shared_features), dim=1
+            )
+            part_order_global = (
+                self.part_order_head(shared_features)
+                * part_order_attention_weights
+            ).sum(dim=1)
         if not return_dict:
-            return (
+            outputs = (
                 latent_output,
                 param1_global,
                 param2_global,
                 param3_global,
                 motion_type_global,
             )
-        return {
+            if self.generation_mode == "set":
+                outputs += (presence_global, part_order_global)
+            return outputs
+        outputs = {
             "latent": latent_output,
             "param1": param1_global,
             "param2": param2_global,
             "param3": param3_global,
             "motion_type": motion_type_global,
         }
+        if self.generation_mode == "set":
+            outputs["presence"] = presence_global
+            outputs["part_order"] = part_order_global
+        return outputs

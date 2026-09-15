@@ -34,7 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-config-path",
         type=Path,
-        default=ROOT / "urdf_anything/model/URDFModel_config.yaml",
+        default=None,
+        help="Optional config override; by default use config embedded in checkpoint",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--ids", nargs="*")
@@ -43,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-links", type=int, default=16)
     parser.add_argument("--num-tokens", type=int, default=512)
     parser.add_argument("--eot-threshold", type=float, default=0.5)
+    parser.add_argument("--presence-threshold", type=float, default=0.5)
     parser.add_argument("--max-reconstruction-attempts", type=int, default=3)
     parser.add_argument("--overlap-chamfer-threshold", type=float, default=3e-2)
     parser.add_argument("--resume", action="store_true")
@@ -225,11 +227,14 @@ def main() -> None:
 
     inference = URDFInference(
         model_path=str(args.model_path),
-        model_config_path=str(args.model_config_path),
+        model_config_path=(
+            str(args.model_config_path) if args.model_config_path else None
+        ),
         dino_path=str(args.dino_path),
         device=args.device,
         num_tokens=args.num_tokens,
         eot_threshold=args.eot_threshold,
+        presence_threshold=args.presence_threshold,
         max_reconstruction_attempts=args.max_reconstruction_attempts,
         overlap_chamfer_threshold=args.overlap_chamfer_threshold,
         max_links=args.max_links,

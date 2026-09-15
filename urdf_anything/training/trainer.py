@@ -45,6 +45,12 @@ class DiTTrainer:
         self.model_config["ditrunner"]["history_mode"] = self.config.get(
             "history_mode", "geometry"
         )
+        self.model_config["ditrunner"]["generation_mode"] = self.config.get(
+            "generation_mode", "autoregressive"
+        )
+        self.model_config["ditrunner"]["num_part_slots"] = self.config.get(
+            "num_part_slots", 5
+        )
 
         init_mode = self.config.get("init_mode", "train_from_scratch")
         checkpoint_path = self.config.get("checkpoint_path", None)
@@ -55,6 +61,11 @@ class DiTTrainer:
             init_mode=init_mode,
             checkpoint_path=checkpoint_path,
         ).to(device)
+        self.generation_mode = self.config.get(
+            "generation_mode", "autoregressive"
+        )
+        if self.generation_mode == "set":
+            self.model.DiTRunner.model.gradient_checkpointing = True
 
         if self.is_distributed:
             self.model = DDP(self.model, device_ids=[local_rank], output_device=local_rank)
@@ -122,6 +133,8 @@ class DiTTrainer:
         urdf_params = self.config.get("train_urdf_params", False)
         no_3d_whole = self.config.get("no_3d_whole", False)
         history_mode = self.config.get("history_mode", "geometry")
+        generation_mode = self.config.get("generation_mode", "autoregressive")
+        num_part_slots = self.config.get("num_part_slots", 5)
 
         lr_str = f"lr{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
         batch_str = f"bs{batch_size}"
@@ -130,11 +143,16 @@ class DiTTrainer:
         urdf_params_str = "_urdf-params" if urdf_params else ""
         no_3d_whole_str = "_no3dwhole" if no_3d_whole else ""
         history_str = "_motion-history" if history_mode == "geometry_motion" else ""
-        experiment_name = f"{lr_str}_{batch_str}_{epoch_str}{eot_str}{urdf_params_str}{no_3d_whole_str}{history_str}"
+        generation_str = (
+            f"_set{num_part_slots}" if generation_mode == "set" else ""
+        )
+        experiment_name = f"{lr_str}_{batch_str}_{epoch_str}{eot_str}{urdf_params_str}{no_3d_whole_str}{history_str}{generation_str}"
         return experiment_name
 
     def train_step(self, batch):
         """Single training step."""
+        if self.generation_mode == "set":
+            return self._train_step_set(batch)
         self.model.train()
         self.optimizer.zero_grad()
 
@@ -341,8 +359,199 @@ class DiTTrainer:
         self.global_step += 1
         return total_loss.item()
 
+    def _compute_set_losses(self, batch):
+        """Forward and compute the simultaneous fixed-slot objective."""
+        model_to_use = self.model.module if self.is_distributed else self.model
+        dino_features = model_to_use.dino_adapter(
+            batch["dino_features"].to(self.device)
+        )
+        encode_wholes = batch["encode_whole"].to(self.device)
+        target_labels = batch["target_labels"].to(self.device)
+        batch_size, num_slots, seq_length, latent_dim = target_labels.shape
+        if num_slots != self.config.get("num_part_slots", 5):
+            raise ValueError(
+                f"batch has {num_slots} slots, expected "
+                f"{self.config.get('num_part_slots', 5)}"
+            )
+
+        noise = torch.randn_like(target_labels)
+        object_timesteps = torch.randint(
+            0, self.num_train_timesteps, (batch_size,), device=self.device
+        )
+        timesteps = object_timesteps[:, None].expand(-1, num_slots).reshape(-1)
+        target_flat = target_labels.reshape(-1, seq_length, latent_dim)
+        noise_flat = noise.reshape_as(target_flat)
+        noisy_latents = self.noise_scheduler.add_noise(
+            target_flat, noise_flat, timesteps
+        )
+
+        model_output = model_to_use.DiTRunner.model(
+            hidden_states=noisy_latents,
+            timestep=timesteps,
+            encoder_hidden_states=dino_features.repeat_interleave(
+                num_slots, dim=0
+            ),
+            encoder_hidden_states_2=encode_wholes.repeat_interleave(
+                num_slots, dim=0
+            ),
+        )
+        latent_pred = model_output["latent"].reshape_as(target_labels)
+        presence_pred = model_output["presence"].reshape(batch_size, num_slots)
+        part_order_pred = model_output["part_order"].reshape(
+            batch_size, num_slots, num_slots
+        )
+        param1_pred = model_output["param1"].reshape(batch_size, num_slots, 3)
+        param2_pred = model_output["param2"].reshape(batch_size, num_slots, 3)
+        param3_pred = model_output["param3"].reshape(batch_size, num_slots, 2)
+        motion_type_pred = model_output["motion_type"].reshape(
+            batch_size, num_slots, 2
+        )
+
+        noise_scheduler_config = self.model_config["ditrunner"]["noise_scheduler"]
+        if noise_scheduler_config["prediction_type"] == "epsilon":
+            geometry_target = noise
+        elif noise_scheduler_config["prediction_type"] == "v_prediction":
+            geometry_target = self.noise_scheduler.get_velocity(
+                target_flat, noise_flat, timesteps
+            ).reshape_as(target_labels)
+        else:
+            geometry_target = target_labels
+
+        presence_target = batch["presence"].to(self.device)
+        real_mask = presence_target.bool()
+        padding_mask = ~real_mask
+        zero = latent_pred.sum() * 0.0
+        geometry_real = (
+            F.mse_loss(latent_pred[real_mask], geometry_target[real_mask])
+            if real_mask.any()
+            else zero
+        )
+        geometry_padding = (
+            F.mse_loss(
+                latent_pred[padding_mask], geometry_target[padding_mask]
+            )
+            if padding_mask.any()
+            else zero
+        )
+        geometry_loss = geometry_real + 0.1 * geometry_padding
+        presence_loss = F.binary_cross_entropy_with_logits(
+            presence_pred, presence_target
+        )
+
+        part_order_targets = batch["part_order_targets"].to(self.device)
+        part_order_loss = (
+            F.cross_entropy(
+                part_order_pred[real_mask], part_order_targets[real_mask]
+            )
+            if real_mask.any()
+            else zero
+        )
+
+        timestep_mask = object_timesteps[:, None] < self.urdf_loss_timestep_threshold
+        motion_mask = (
+            real_mask
+            & batch["has_urdf"].to(self.device).bool()
+            & (part_order_targets > 0)
+            & timestep_mask
+        )
+        if motion_mask.any() and self.config.get("train_urdf_params", False):
+            origin_loss = F.l1_loss(
+                param1_pred[motion_mask],
+                batch["urdf_origins"].to(self.device)[motion_mask],
+            )
+            axis_loss = F.l1_loss(
+                param2_pred[motion_mask],
+                batch["urdf_axes"].to(self.device)[motion_mask],
+            )
+            limits_loss = F.l1_loss(
+                param3_pred[motion_mask],
+                batch["lower_upper_limits"].to(self.device)[motion_mask],
+            )
+            motion_type_loss = F.cross_entropy(
+                motion_type_pred[motion_mask],
+                batch["motion_types"].to(self.device)[motion_mask],
+            )
+        else:
+            origin_loss = zero
+            axis_loss = zero
+            limits_loss = zero
+            motion_type_loss = zero
+
+        auxiliary_loss = (
+            presence_loss
+            + part_order_loss
+            + origin_loss
+            + axis_loss
+            + limits_loss
+            + motion_type_loss
+        )
+        total_loss = geometry_loss + 0.01 * auxiliary_loss
+        return {
+            "total": total_loss,
+            "geometry": geometry_loss,
+            "geometry_real": geometry_real,
+            "geometry_padding": geometry_padding,
+            "presence": presence_loss,
+            "part_order": part_order_loss,
+            "origin": origin_loss,
+            "axis": axis_loss,
+            "limits": limits_loss,
+            "motion_type": motion_type_loss,
+        }
+
+    def _train_step_set(self, batch):
+        self.model.train()
+        self.optimizer.zero_grad()
+        losses = self._compute_set_losses(batch)
+        losses["total"].backward()
+        self.optimizer.step()
+        if self.rank == 0 and self.use_wandb and wandb is not None:
+            wandb.log(
+                {
+                    f"train/{name}_loss": value.item()
+                    for name, value in losses.items()
+                }
+                | {
+                    "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "train/step": self.global_step,
+                }
+            )
+        self.global_step += 1
+        return losses["total"].item()
+
+    def _validate_set(self, val_loader):
+        self.model.eval()
+        totals = {}
+        num_batches = 0
+        with torch.no_grad():
+            for batch in tqdm(
+                val_loader, desc="Validating", disable=self.local_rank != 0
+            ):
+                losses = self._compute_set_losses(batch)
+                for name, value in losses.items():
+                    totals[name] = totals.get(name, 0.0) + value.item()
+                num_batches += 1
+        if num_batches == 0:
+            raise ValueError("validation loader is empty")
+        self.last_set_val_metrics = {
+            name: value / num_batches for name, value in totals.items()
+        }
+        metrics = self.last_set_val_metrics
+        return (
+            metrics["total"],
+            metrics["origin"],
+            metrics["axis"],
+            metrics["limits"],
+            metrics["geometry"],
+            0.0,
+            0.0,
+            metrics["motion_type"],
+        )
+
     def validate(self, val_loader):
         """Validation - use complete denoising process."""
+        if self.generation_mode == "set":
+            return self._validate_set(val_loader)
         self.model.eval()
         total_loss = 0
         num_batches = 0
@@ -576,6 +785,14 @@ class DiTTrainer:
         noise_scheduler_config = self.model_config["ditrunner"]["noise_scheduler"]
         print("prediction_type:", noise_scheduler_config["prediction_type"])
         print("train_urdf_params:", self.config.get("train_urdf_params", False))
+        print("generation_mode:", self.generation_mode)
+        if self.generation_mode == "set":
+            print(
+                "gradient_checkpointing:",
+                self.model.DiTRunner.model.gradient_checkpointing
+                if not self.is_distributed
+                else self.model.module.DiTRunner.model.gradient_checkpointing,
+            )
         if self.rank == 0:
             config_path = os.path.join(self.save_checkpoint_dir, "config.json")
             with open(config_path, "w") as f:
@@ -626,6 +843,16 @@ class DiTTrainer:
                     )
                 if val_motion_type_loss > 0:
                     print(f"  Val Motion Type Loss: {val_motion_type_loss:.6f}")
+                if self.generation_mode == "set":
+                    set_metrics = self.last_set_val_metrics
+                    print(
+                        "  Val Presence Loss: "
+                        f"{set_metrics['presence']:.6f}, Val Part Order Loss: "
+                        f"{set_metrics['part_order']:.6f}, Val Geometry Real Loss: "
+                        f"{set_metrics['geometry_real']:.6f}, "
+                        "Val Geometry Padding Loss: "
+                        f"{set_metrics['geometry_padding']:.6f}"
+                    )
 
             if self.rank == 0:
                 if (epoch + 1) % save_interval == 0:
@@ -658,6 +885,10 @@ class DiTTrainer:
                             "init_mode": self.config.get("init_mode", "train_from_scratch"),
                             "history_mode": self.config.get(
                                 "history_mode", "geometry"
+                            ),
+                            "generation_mode": self.generation_mode,
+                            "num_part_slots": self.config.get(
+                                "num_part_slots", 5
                             ),
                             "checkpoint_path": self.config.get("checkpoint_path", None),
                             "save_checkpoint_dir": self.save_checkpoint_dir,

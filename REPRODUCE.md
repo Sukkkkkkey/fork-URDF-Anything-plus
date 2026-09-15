@@ -286,3 +286,49 @@ CUDA_VISIBLE_DEVICES=0 "$ENV_PREFIX/bin/python" -u scripts/train.py \
 
 训练会列出新增 GRU/AdaLN 的 missing keys，这是用旧 checkpoint 初始化新分支的预期
 现象。`--deterministic` 下 memory-efficient attention 仍会给出反向非严格确定的警告。
+
+### 8.2 Simultaneous part set denoising
+
+复用 8.1 的 512-token 缓存，但 dataset 按对象/图像聚合；单个 batch 包含 5 个 slots，
+其中 Microwave `7201` 是 3 real + 2 zero-latent padding。真实 parts 在训练时随机分配
+slot，validation 使用确定性 slot；part-order 标签由 OBJ AABB minimum 按
+`Z -> X -> Y` 排序得到。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 "$ENV_PREFIX/bin/python" -u scripts/train.py \
+  --cache_path "$DESIGN_OUT/cache/microwave_7201_token512" \
+  --generation_mode set --num_part_slots 5 \
+  --batch_size 1 --learning_rate 1e-5 --max_epochs 1 --save_interval 1 \
+  --init_mode resume_from_ckpt \
+  --checkpoint_path "$URDF_OUT/checkpoints/urdf-anything-plus/epoch_200.pth" \
+  --train_urdf_params True --train_eot False --use_wandb False \
+  --save_optimizer False --save_checkpoint_dir "$DESIGN_OUT/set-denoising" \
+  --seed 42 --deterministic 2>&1 | tee "$DESIGN_OUT/set-denoising-train.log"
+```
+
+日志明确打印 `generation_mode: set`、`gradient_checkpointing: True`。2026-09-15
+实测 `Train Loss=0.906143`、`Val Loss=0.983762`、
+`Val Geometry Real Loss=0.957616`、`Val Geometry Padding Loss=0.028583`、
+`Val Presence Loss=0.698387`、`Val Part Order Loss=1.630387`。本轮随机 validation
+timestep 不满足 `t < 300`，所以 motion 分项为 0，符合 loss mask 设计。输出：
+
+```text
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/set-denoising-train.log
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/set-denoising/lr1e-5_bs1_ep1_urdf-params_set5/config.json
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/set-denoising/lr1e-5_bs1_ep1_urdf-params_set5/epoch_1.pth
+```
+
+set checkpoint 推理时不传 `--model_config_path`，让入口读取 checkpoint 内嵌的
+`generation_mode=set` 与 slot 数；可用 `--presence_threshold` 调整 slot 过滤阈值。
+如果全部 slots 都低于阈值，推理仍保留最高分槽。示例：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 "$ENV_PREFIX/bin/python" scripts/inference.py \
+  --image_path "$DESIGN_DATA/Microwave_urdf/7201/images/0.png" \
+  --whole_mesh_path "$DESIGN_DATA/Microwave_urdf/7201/whole.obj" \
+  --model_path "$DESIGN_OUT/set-denoising/lr1e-5_bs1_ep1_urdf-params_set5/epoch_1.pth" \
+  --dino_path "$URDF_OUT/checkpoints/dinov3-vith16plus-pretrain-lvd1689m" \
+  --triposg_vae_path "$URDF_OUT/checkpoints/triposg/vae" \
+  --output_dir "$DESIGN_OUT/set-denoising-inference" \
+  --presence_threshold 0.5 --seed 42 --vae_deterministic
+```
