@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence
 
 from .dit_triposg import TripoSGDiTModel
 
@@ -18,6 +19,9 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         cross_attention_2_dim: int = 64,
         additional_output_dims: tuple = (3, 3, 2),
         shared_hidden_dim: int = 512,
+        history_mode: str = "geometry",
+        motion_history_dim: int = 10,
+        motion_history_hidden_dim: int = 256,
     ):
         super().__init__(
             num_attention_heads=num_attention_heads,
@@ -30,8 +34,43 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         )
         self.additional_output_dims = additional_output_dims
         self.shared_hidden_dim = shared_hidden_dim
+        if history_mode not in ("geometry", "geometry_motion"):
+            raise ValueError(f"unsupported history_mode: {history_mode}")
+        self.history_mode = history_mode
+        self.motion_history_hidden_dim = motion_history_hidden_dim
+        if self.history_mode == "geometry_motion":
+            self.motion_history_encoder = nn.GRU(
+                input_size=motion_history_dim,
+                hidden_size=motion_history_hidden_dim,
+                num_layers=1,
+                batch_first=True,
+            )
+            for block in self.blocks:
+                block.enable_motion_adaln(motion_history_hidden_dim)
+        else:
+            self.motion_history_encoder = None
         self.proj_out = nn.Linear(self.inner_dim, self.shared_hidden_dim, bias=True)
         self._create_output_heads()
+
+    def encode_motion_history(self, motion_history, motion_history_lengths):
+        batch_size = motion_history.shape[0]
+        condition = motion_history.new_zeros(
+            batch_size, self.motion_history_hidden_dim
+        )
+        nonempty = motion_history_lengths > 0
+        if not nonempty.any():
+            return condition
+        indices = nonempty.nonzero(as_tuple=False).flatten()
+        sequences = motion_history.index_select(0, indices)
+        lengths = motion_history_lengths.index_select(0, indices).to("cpu")
+        packed = pack_padded_sequence(
+            sequences,
+            lengths,
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        _, hidden = self.motion_history_encoder(packed)
+        return condition.index_copy(0, indices, hidden[-1])
 
     def _create_output_heads(self):
         self.latent_head = nn.Sequential(
@@ -94,6 +133,8 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         encoder_hidden_states_2=None,
         image_rotary_emb=None,
         attention_kwargs=None,
+        motion_history=None,
+        motion_history_lengths=None,
         return_dict=True,
     ):
         if attention_kwargs is not None:
@@ -103,6 +144,15 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         temb = self.time_embed(timestep).to(hidden_states.dtype)
         temb = self.time_proj(temb)
         temb = temb.unsqueeze(dim=1)
+        motion_condition = None
+        if self.history_mode == "geometry_motion":
+            if motion_history is None or motion_history_lengths is None:
+                raise ValueError(
+                    "geometry_motion mode requires motion history and lengths"
+                )
+            motion_condition = self.encode_motion_history(
+                motion_history, motion_history_lengths
+            )
         hidden_states = self.proj_in(hidden_states)
         hidden_states = torch.cat([temb, hidden_states], dim=1)
         skips = []
@@ -125,6 +175,7 @@ class MultiOutputDiTModel(TripoSGDiTModel):
                     image_rotary_emb,
                     skip,
                     attention_kwargs,
+                    motion_condition,
                     **ckpt_kwargs,
                 )
             else:
@@ -136,6 +187,7 @@ class MultiOutputDiTModel(TripoSGDiTModel):
                     image_rotary_emb=image_rotary_emb,
                     skip=skip,
                     attention_kwargs=attention_kwargs,
+                    motion_condition=motion_condition,
                 )
             if layer < self.config.num_layers // 2:
                 skips.append(hidden_states)

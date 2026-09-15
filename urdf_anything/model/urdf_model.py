@@ -6,6 +6,7 @@ from TripoSG.triposg.models.autoencoders import TripoSGVAEModel
 
 from .utils import load_model_config, get_default_config_path
 from .dit_runner import DiTRunner
+from urdf_anything.data.urdf_utils import build_motion_cue
 
 
 class URDFModel(nn.Module):
@@ -171,6 +172,7 @@ class URDFModel(nn.Module):
 
     def forward(self, input_dict):
         results = []
+        motion_history = []
         for idx, dino_feat in enumerate(input_dict["dino_list"]):
             if idx == 0:
                 encode_pre = self.SoT
@@ -182,11 +184,29 @@ class URDFModel(nn.Module):
                 "encode_pre": encode_pre,
                 "encode_whole": encode_whole,
             }
+            if self.config["ditrunner"].get("history_mode") == "geometry_motion":
+                if motion_history:
+                    history_tensor = torch.stack(motion_history).unsqueeze(0)
+                else:
+                    history_tensor = torch.empty(1, 0, 10, device=self.device)
+                cond["motion_history"] = history_tensor.to(self.device)
+                cond["motion_history_lengths"] = torch.tensor(
+                    [len(motion_history)], dtype=torch.long, device=self.device
+                )
             output = self.DiTRunner.conditional_sample(cond)
             self.current_latent = output["latent"]
             self.current_param1 = output["param1"]
             self.current_param2 = output["param2"]
             self.current_motion_type = output.get("motion_type", None)
+            if idx > 0 and self.current_motion_type is not None:
+                motion_history.append(
+                    build_motion_cue(
+                        self.current_param1[0],
+                        self.current_param2[0],
+                        output["param3"][0],
+                        torch.argmax(self.current_motion_type[0]),
+                    ).to(self.device)
+                )
             mesh, points, self.current_latent = self.Sample_SDF([output["latent"]])
             results.append(
                 {

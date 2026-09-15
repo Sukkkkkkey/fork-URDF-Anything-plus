@@ -176,6 +176,10 @@ class DiTBlock(nn.Module):
         else:
             self.skip_linear = None
 
+        # Opt-in motion-history AdaLN. It is attached only by the
+        # geometry_motion ablation, so the default model/state dict is unchanged.
+        self.motion_adaln = None
+
         # let chunk size default to None
         self._chunk_size = None
         self._chunk_dim = 0
@@ -193,6 +197,14 @@ class DiTBlock(nn.Module):
         self._chunk_size = chunk_size
         self._chunk_dim = dim
 
+    def enable_motion_adaln(self, condition_dim: int):
+        self.motion_adaln = nn.Sequential(
+            nn.SiLU(), nn.Linear(condition_dim, 2 * self.norm3.normalized_shape[0])
+        )
+        modulation = self.motion_adaln[-1]
+        nn.init.zeros_(modulation.weight)
+        nn.init.zeros_(modulation.bias)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -202,6 +214,7 @@ class DiTBlock(nn.Module):
         image_rotary_emb: Optional[torch.Tensor] = None,
         skip: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        motion_condition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Prepare attention kwargs
         attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
@@ -265,6 +278,13 @@ class DiTBlock(nn.Module):
 
         # FFN Layer ### TODO: switch norm2 and norm3 in the state dict
         mlp_inputs = self.norm3(hidden_states)
+        if motion_condition is not None:
+            if self.motion_adaln is None:
+                raise ValueError("motion_condition requires motion AdaLN to be enabled")
+            scale, shift = self.motion_adaln(motion_condition).chunk(2, dim=-1)
+            mlp_inputs = (
+                mlp_inputs * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            )
         hidden_states = hidden_states + self.ff(mlp_inputs)
 
         return hidden_states

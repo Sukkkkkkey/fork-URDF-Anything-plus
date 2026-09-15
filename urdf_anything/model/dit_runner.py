@@ -27,6 +27,11 @@ class DiTRunner(nn.Module):
             cross_attention_dim=1024,
             additional_output_dims=(3, 3, 2),
             shared_hidden_dim=512,
+            history_mode=config.get("history_mode", "geometry"),
+            motion_history_dim=config.get("motion_history_dim", 10),
+            motion_history_hidden_dim=config.get(
+                "motion_history_hidden_dim", 256
+            ),
         ).to(device)
 
         if load_dit_pretrained:
@@ -107,6 +112,8 @@ class DiTRunner(nn.Module):
                 timestep=t,
                 encoder_hidden_states=cond["dino"],
                 encoder_hidden_states_2=encoder_hidden_states_2,
+                motion_history=cond.get("motion_history"),
+                motion_history_lengths=cond.get("motion_history_lengths"),
             )
             if isinstance(model_output, dict):
                 latent_pred = model_output["latent"]

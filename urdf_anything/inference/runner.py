@@ -10,6 +10,7 @@ from scipy.spatial import cKDTree
 from transformers import AutoImageProcessor, AutoModel
 
 from urdf_anything.model import URDFModel
+from urdf_anything.data.urdf_utils import build_motion_cue
 from TripoSG.triposg.inference_utils import hierarchical_extract_geometry
 
 from .utils import resize_image_tensor, ensure_watertight
@@ -50,6 +51,9 @@ class URDFInference:
         )
         self.model.eval()
         self.model = self.model.to(device)
+        self.history_mode = self.model.config["ditrunner"].get(
+            "history_mode", "geometry"
+        )
 
         print(f"loading DINO model: {dino_path}")
         self.dino_processor = AutoImageProcessor.from_pretrained(dino_path)
@@ -203,6 +207,7 @@ class URDFInference:
         encode_whole: torch.Tensor,
         link_idx: int,
         generator: Optional[torch.Generator] = None,
+        motion_history: Optional[List[torch.Tensor]] = None,
     ) -> Dict:
         """Generate one link: DiT sample -> mesh (or EoT)."""
         cond = {
@@ -210,6 +215,16 @@ class URDFInference:
             "encode_pre": encode_pre,
             "encode_whole": encode_whole,
         }
+        if self.history_mode == "geometry_motion":
+            motion_history = motion_history or []
+            if motion_history:
+                history_tensor = torch.stack(motion_history).unsqueeze(0)
+            else:
+                history_tensor = torch.empty(1, 0, 10)
+            cond["motion_history"] = history_tensor.to(self.device)
+            cond["motion_history_lengths"] = torch.tensor(
+                [len(motion_history)], dtype=torch.long, device=self.device
+            )
         with torch.no_grad():
             output = self.model.DiTRunner.conditional_sample(
                 cond, generator=generator
@@ -266,6 +281,7 @@ class URDFInference:
         encode_pre: torch.Tensor,
         encode_whole: torch.Tensor,
         link_idx: int,
+        motion_history: Optional[List[torch.Tensor]] = None,
     ) -> Optional[Dict]:
         """Generate link with retries."""
         for attempt in range(self.max_reconstruction_attempts):
@@ -281,6 +297,7 @@ class URDFInference:
                     encode_whole,
                     link_idx,
                     generator=gen,
+                    motion_history=motion_history,
                 )
                 if result["pred_mesh"] is not None or result["is_eot"]:
                     if attempt > 0:
@@ -331,11 +348,16 @@ class URDFInference:
         encode_pre = self.model.SoT
         prev_meshes = []
         all_results = []
+        motion_history = []
 
         while link_idx < self.max_links:
             print(f"\ngenerating Link {link_idx}...")
             result = self.reconstruct_link_with_retry(
-                dino_features, encode_pre, encode_whole, link_idx
+                dino_features,
+                encode_pre,
+                encode_whole,
+                link_idx,
+                motion_history=motion_history,
             )
             if result is None:
                 print(f"Link {link_idx} failed, stopping generation")
@@ -382,6 +404,18 @@ class URDFInference:
                             else "prismatic"
                         )
                         print(f"  Motion Type: {motion_name}")
+                    if all(
+                        result[key] is not None
+                        for key in ("param1", "param2", "param3", "motion_type")
+                    ):
+                        motion_history.append(
+                            build_motion_cue(
+                                result["param1"],
+                                result["param2"],
+                                result["param3"],
+                                torch.argmax(result["motion_type"]),
+                            )
+                        )
             all_results.append({"link_idx": link_idx, **result})
             link_idx += 1
             if link_idx < self.max_links:

@@ -89,6 +89,12 @@ def main():
         help="Dropout rate for encode_pre (0-1, None means no dropout)",
     )
     parser.add_argument(
+        "--history_mode",
+        choices=["geometry", "geometry_motion"],
+        default="geometry",
+        help="Autoregressive history condition ablation",
+    )
+    parser.add_argument(
         "--urdf_loss_timestep_ratio",
         type=float,
         default=0.3,
@@ -157,6 +163,7 @@ def main():
         "use_wandb": args.use_wandb == "True",
         "seed": args.seed,
         "deterministic": args.deterministic,
+        "history_mode": args.history_mode,
     }
 
     if local_rank == 0:

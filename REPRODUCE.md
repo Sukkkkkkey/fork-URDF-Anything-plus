@@ -223,3 +223,66 @@ test -f "$URDF_OUT/training-smoke/inference/PartNetMobility-test-oriented-final/
 test -f "$URDF_OUT/training-smoke/evaluation/12252-final/summary.json"
 test -f "$URDF_OUT/training-smoke/visualization/12252_prediction_final.png"
 ```
+
+## 8. 设计对比 smoke training
+
+两项对比的固定结构、loss 和设计参数见
+[`design-comparison.md`](design-comparison.md)。本节只记录已实际执行并通过的命令；
+结果是链路测试，不表示模型收敛。
+
+### 8.1 Motion-aware autoregressive history
+
+从作者归档抽取有 3 个 parts 的 Microwave `7201`。归档里的 `info.json` 将
+`whole_image` 写成不存在的 `body.png`，实际可用成员是 `images/0.png`；缓存构建器
+会枚举 `images/`，因此使用后者：
+
+```bash
+export DESIGN_DATA=/data2/LiuShuqi/data/processed/URDF-Anything-plus-design-smoke
+export DESIGN_OUT=/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison
+
+mkdir -p "$DESIGN_DATA/Microwave_urdf"
+tar --occurrence=1 -xzf "$AUTHOR_DATA/data_normalized.tar.gz" \
+  -C "$DESIGN_DATA/Microwave_urdf" --strip-components=2 \
+  data_normalized/Microwave_urdf/7201/test.urdf \
+  data_normalized/Microwave_urdf/7201/whole.obj \
+  data_normalized/Microwave_urdf/7201/images/0.png \
+  data_normalized/Microwave_urdf/7201/body.obj \
+  data_normalized/Microwave_urdf/7201/door_1.obj \
+  data_normalized/Microwave_urdf/7201/door_2.obj \
+  data_normalized/Microwave_urdf/7201/info.json
+
+CUDA_VISIBLE_DEVICES=0 "$ENV_PREFIX/bin/python" scripts/build_cache.py \
+  --data_root "$DESIGN_DATA/Microwave_urdf" \
+  --cache_name microwave_7201 --allow_single_object_overlap \
+  --cache_dir "$DESIGN_OUT/cache" \
+  --dino_model_path "$URDF_OUT/checkpoints/dinov3-vith16plus-pretrain-lvd1689m" \
+  --triposg_vae_path "$URDF_OUT/checkpoints/triposg/vae" \
+  --token_length 512 --seed 42
+```
+
+缓存生成 4 个 train 和 4 个 val samples；实际检查 `body`、`door_1`、`door_2`、
+EOT 的 motion-history 长度分别为 `0, 0, 1, 2`。训练命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 "$ENV_PREFIX/bin/python" -u scripts/train.py \
+  --cache_path "$DESIGN_OUT/cache/microwave_7201_token512" \
+  --history_mode geometry_motion \
+  --batch_size 1 --learning_rate 1e-5 --max_epochs 1 --save_interval 1 \
+  --init_mode resume_from_ckpt \
+  --checkpoint_path "$URDF_OUT/checkpoints/urdf-anything-plus/epoch_200.pth" \
+  --train_urdf_params True --train_eot True --use_wandb False \
+  --save_optimizer False --save_checkpoint_dir "$DESIGN_OUT/motion-history" \
+  --seed 42 --deterministic 2>&1 | tee "$DESIGN_OUT/motion-history-train.log"
+```
+
+2026-09-15 实测 `Train Loss=0.690475`、`Val Loss=0.641541`、
+`Val Latent Loss=0.640752`、`Val Motion Type Loss=0.000160`。输出：
+
+```text
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/motion-history-train.log
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/motion-history/lr1e-5_bs1_ep1_eot_urdf-params_motion-history/config.json
+/data2/LiuShuqi/output/URDF-Anything-plus/design-comparison/motion-history/lr1e-5_bs1_ep1_eot_urdf-params_motion-history/epoch_1.pth
+```
+
+训练会列出新增 GRU/AdaLN 的 missing keys，这是用旧 checkpoint 初始化新分支的预期
+现象。`--deterministic` 下 memory-efficient attention 仍会给出反向非严格确定的警告。

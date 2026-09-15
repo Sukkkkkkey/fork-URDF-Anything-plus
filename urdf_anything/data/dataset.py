@@ -3,7 +3,11 @@ import os
 import torch
 from torch.utils.data import Dataset
 
-from .urdf_utils import load_info_json, get_urdf_params_from_info
+from .urdf_utils import (
+    get_motion_history_from_info,
+    get_urdf_params_from_info,
+    load_info_json,
+)
 
 from .cache import load_single_data_item
 
@@ -90,6 +94,7 @@ class CachedDataset(Dataset):
             return None
 
         info_data = load_info_json(obj_dir)
+        data["motion_history"] = get_motion_history_from_info(info_data, link_idx)
         origin_xyz, axis_xyz, lower_upper_limits, motion_type = get_urdf_params_from_info(info_data, link_idx)
 
         if origin_xyz is not None and axis_xyz is not None and lower_upper_limits is not None and motion_type is not None:
@@ -120,6 +125,17 @@ def collate_fn(batch):
     lower_upper_limits = torch.stack([item["lower_upper_limits"] for item in batch])
     motion_types = torch.stack([item["motion_type"] for item in batch])
     link_indices = torch.tensor([item["link_idx"] for item in batch])
+    motion_history_lengths = torch.tensor(
+        [item["motion_history"].shape[0] for item in batch], dtype=torch.long
+    )
+    max_history_length = int(motion_history_lengths.max().item())
+    motion_histories = torch.zeros(
+        len(batch), max_history_length, 10, dtype=torch.float32
+    )
+    for index, item in enumerate(batch):
+        history_length = item["motion_history"].shape[0]
+        if history_length:
+            motion_histories[index, :history_length] = item["motion_history"]
 
     is_eot = torch.tensor([item.get("link_name") == "eot" for item in batch])
     return {
@@ -136,4 +152,6 @@ def collate_fn(batch):
         "link_names": [item["link_name"] for item in batch],
         "lower_upper_limits": lower_upper_limits.detach(),
         "motion_types": motion_types.detach(),
+        "motion_histories": motion_histories.detach(),
+        "motion_history_lengths": motion_history_lengths.detach(),
     }

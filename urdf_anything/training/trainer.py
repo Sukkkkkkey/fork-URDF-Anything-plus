@@ -42,6 +42,9 @@ class DiTTrainer:
             "model_config_path", "urdf_anything/model/URDFModel_config.yaml"
         )
         self.model_config = load_model_config(model_config_path)
+        self.model_config["ditrunner"]["history_mode"] = self.config.get(
+            "history_mode", "geometry"
+        )
 
         init_mode = self.config.get("init_mode", "train_from_scratch")
         checkpoint_path = self.config.get("checkpoint_path", None)
@@ -118,6 +121,7 @@ class DiTTrainer:
         eot = self.config.get("train_eot", False)
         urdf_params = self.config.get("train_urdf_params", False)
         no_3d_whole = self.config.get("no_3d_whole", False)
+        history_mode = self.config.get("history_mode", "geometry")
 
         lr_str = f"lr{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
         batch_str = f"bs{batch_size}"
@@ -125,7 +129,8 @@ class DiTTrainer:
         eot_str = "_eot" if eot else ""
         urdf_params_str = "_urdf-params" if urdf_params else ""
         no_3d_whole_str = "_no3dwhole" if no_3d_whole else ""
-        experiment_name = f"{lr_str}_{batch_str}_{epoch_str}{eot_str}{urdf_params_str}{no_3d_whole_str}"
+        history_str = "_motion-history" if history_mode == "geometry_motion" else ""
+        experiment_name = f"{lr_str}_{batch_str}_{epoch_str}{eot_str}{urdf_params_str}{no_3d_whole_str}{history_str}"
         return experiment_name
 
     def train_step(self, batch):
@@ -176,6 +181,11 @@ class DiTTrainer:
                 encode_pres[non_first_link_mask] = encode_pres[non_first_link_mask] * mask[non_first_link_mask]
 
         cond = {"dino": dino_features, "encode_pre": encode_pres, "encode_whole": encode_wholes}
+        if self.config.get("history_mode") == "geometry_motion":
+            cond["motion_history"] = batch["motion_histories"].to(self.device)
+            cond["motion_history_lengths"] = batch[
+                "motion_history_lengths"
+            ].to(self.device)
 
         noise = torch.randn_like(target_labels)
         timesteps = torch.randint(0, self.num_train_timesteps, (target_labels.shape[0],), device=self.device)
@@ -199,6 +209,8 @@ class DiTTrainer:
             timestep=timesteps,
             encoder_hidden_states=cond["dino"],
             encoder_hidden_states_2=encoder_hidden_states_2,
+            motion_history=cond.get("motion_history"),
+            motion_history_lengths=cond.get("motion_history_lengths"),
         )
 
         if isinstance(model_output, dict):
@@ -376,6 +388,13 @@ class DiTTrainer:
                         encode_pres.append(batch["encode_pres"][i : i + 1].to(self.device))
                 encode_pres = torch.cat(encode_pres, dim=0)
                 cond = {"dino": dino_features, "encode_pre": encode_pres, "encode_whole": encode_wholes}
+                if self.config.get("history_mode") == "geometry_motion":
+                    cond["motion_history"] = batch["motion_histories"].to(
+                        self.device
+                    )
+                    cond["motion_history_lengths"] = batch[
+                        "motion_history_lengths"
+                    ].to(self.device)
 
                 noisy_latents = torch.randn_like(target_labels)
                 timesteps = torch.randint(
@@ -403,6 +422,8 @@ class DiTTrainer:
                     timestep=timesteps,
                     encoder_hidden_states=cond["dino"],
                     encoder_hidden_states_2=encoder_hidden_states_2,
+                    motion_history=cond.get("motion_history"),
+                    motion_history_lengths=cond.get("motion_history_lengths"),
                 )
                 if isinstance(model_output, dict):
                     latent_pred = model_output["latent"]
@@ -635,6 +656,9 @@ class DiTTrainer:
                                 "encode_pre_dropout_rate", None
                             ),
                             "init_mode": self.config.get("init_mode", "train_from_scratch"),
+                            "history_mode": self.config.get(
+                                "history_mode", "geometry"
+                            ),
                             "checkpoint_path": self.config.get("checkpoint_path", None),
                             "save_checkpoint_dir": self.save_checkpoint_dir,
                             "model_config_path": self.config.get("model_config_path", None),
