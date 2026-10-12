@@ -2,6 +2,18 @@
 
 > **这是一份活文档。** 当前代码版本和复现状态须随工作进展更新。
 
+## 2026-10-12 收尾状态
+
+按用户决定暂停设计对比工作。motion run `pl8qobrc` 已运行完 10 epochs，保存
+epoch 5/10；诊断发现 DDP forward 绕过，四卡各自更新，现有结果不能作为有效
+同步四卡消融。固定噪声对照显示几何 loss 平台，motion 几何收益未获可靠证据。
+DDP 问题未修复，不继续调参、重训练或扩展 set 实验。
+
+详细结论、实验配置、完整产物路径和重现命令见
+[MOTION_CUE_DIAGNOSIS.md](MOTION_CUE_DIAGNOSIS.md)；设计验收状态见
+[design-comparison.md](design-comparison.md)。下文 PartNet 复现指标属于此前
+基线评估，不是 motion cue 改进结果。
+
 ## 固定路径
 
 - 代码：`/data1/LiuShuqi/code/articulation/baselines/URDF-Anything-plus`

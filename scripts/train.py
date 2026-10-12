@@ -48,6 +48,18 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--max_epochs", type=int, default=200, help="Maximum training epochs")
     parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="Optional per-epoch train-step cap for short tuning runs",
+    )
+    parser.add_argument(
+        "--max_val_steps",
+        type=int,
+        default=None,
+        help="Optional per-epoch validation-step cap for short tuning runs",
+    )
+    parser.add_argument(
         "--save_interval",
         type=int,
         default=10,
@@ -125,6 +137,24 @@ def main():
         help="Whether to use wandb to log training",
     )
     parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="W&B entity (account or team)",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="urdf-diffusion",
+        help="W&B project name",
+    )
+    parser.add_argument(
+        "--wandb_name_prefix",
+        type=str,
+        default=None,
+        help="Optional prefix for the W&B run name",
+    )
+    parser.add_argument(
         "--save_checkpoint_dir",
         type=str,
         default=None,
@@ -148,6 +178,10 @@ def main():
 
     if args.num_part_slots < 1:
         parser.error("--num_part_slots must be at least 1")
+    if args.max_train_steps is not None and args.max_train_steps < 1:
+        parser.error("--max_train_steps must be at least 1")
+    if args.max_val_steps is not None and args.max_val_steps < 1:
+        parser.error("--max_val_steps must be at least 1")
     if args.generation_mode == "set" and args.history_mode != "geometry":
         parser.error("set mode is an independent geometry-only ablation")
     if args.generation_mode == "set" and args.train_eot == "True":
@@ -174,6 +208,8 @@ def main():
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "max_epochs": args.max_epochs,
+        "max_train_steps": args.max_train_steps,
+        "max_val_steps": args.max_val_steps,
         "save_interval": args.save_interval,
         "init_mode": args.init_mode,
         "checkpoint_path": args.checkpoint_path,
@@ -185,6 +221,9 @@ def main():
         "urdf_loss_timestep_ratio": args.urdf_loss_timestep_ratio,
         "save_optimizer": args.save_optimizer == "True",
         "use_wandb": args.use_wandb == "True",
+        "wandb_entity": args.wandb_entity,
+        "wandb_project": args.wandb_project,
+        "wandb_name_prefix": args.wandb_name_prefix,
         "seed": args.seed,
         "deterministic": args.deterministic,
         "history_mode": args.history_mode,
@@ -217,6 +256,20 @@ def main():
 
     if len(all_train_data) == 0:
         raise ValueError("No training data found!")
+
+    training_config.update(
+        {
+            "world_size": world_size,
+            "global_batch_size": args.batch_size * world_size,
+            "train_samples": len(all_train_data),
+            "val_samples": len(all_test_data),
+            "cache_paths": cache_paths,
+            "optimizer": "AdamW",
+            "optimizer_betas": [0.9, 0.999],
+            "optimizer_eps": 1e-8,
+            "lr_scheduler": "constant",
+        }
+    )
 
     if local_rank == 0:
         print(f"\nTotal:")

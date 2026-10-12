@@ -5,6 +5,10 @@
 收敛或论文指标复现。作者未公开官方评估代码，本文的 PartNet-Mobility 指标是仓库中
 明确标注协议差异的本地实现。
 
+2026-10-12 收尾：设计对比工作已暂停。motion 微调运行完成，但发现训练前向
+绕过 DDP、各 rank 未同步更新；下文多 GPU 命令仅是历史运行方式，当前不能用于
+宣称有效同步训练。详见 [motion cue 诊断报告](MOTION_CUE_DIAGNOSIS.md)。
+
 ## 1. 路径与代码
 
 所有原始数据保持只读；缓存、权重和日志不要写进代码仓库。
@@ -160,6 +164,9 @@ CUDA_VISIBLE_DEVICES=0 python -u scripts/train.py \
 `--cache_path` 后替换为十个 `$URDF_OUT/cache/full/*_eot_token512` 目录。预训练用
 `--init_mode train_from_scratch`；随后以预训练检查点运行
 `--init_mode resume_from_ckpt --train_urdf_params True --train_eot True`。
+
+已知限制（2026-10-12）：上述多 GPU 路径存在 DDP forward 绕过，尚未修复；
+单 GPU smoke 不验证多卡梯度同步。恢复正式实验前必须先修复并检查参数一致性。
 
 ## 6. 推理、评估与可视化
 

@@ -2,9 +2,11 @@ import os
 import sys
 import json
 import platform
+import time
 from datetime import datetime
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,12 +33,15 @@ class DiTTrainer:
         self.is_distributed = world_size > 1
         self.use_wandb = config.get("use_wandb", False) and wandb is not None
         self.save_optimizer = config.get("save_optimizer", False)
+        self.max_train_steps = config.get("max_train_steps")
+        self.max_val_steps = config.get("max_val_steps")
 
         self.cache_paths = cache_paths if cache_paths is not None else []
         self.data_root_map = data_root_map if data_root_map is not None else {}
 
         self.training_start_time = datetime.now().isoformat()
         self.experiment_name = self._generate_experiment_name()
+        self.wandb_run_name = self._generate_wandb_run_name()
 
         model_config_path = self.config.get(
             "model_config_path", "urdf_anything/model/URDFModel_config.yaml"
@@ -115,14 +120,34 @@ class DiTTrainer:
 
             if self.use_wandb and wandb is not None:
                 wandb.init(
-                    project="urdf-diffusion",
-                    name=self.experiment_name,
+                    entity=self.config.get("wandb_entity"),
+                    project=self.config.get("wandb_project", "urdf-diffusion"),
+                    name=self.wandb_run_name,
                     config=self.config,
                     dir=self.save_checkpoint_dir,
                 )
+                wandb.define_metric("train/global_step")
+                wandb.define_metric(
+                    "train/*", step_metric="train/global_step"
+                )
+                wandb.define_metric("epoch/index")
+                wandb.define_metric("epoch/*", step_metric="epoch/index")
         else:
             self.save_checkpoint_dir = None
         self.global_step = 0
+
+    def _distributed_sums(self, values):
+        """Sum scalar statistics across ranks without changing single-GPU runs."""
+        tensor = torch.tensor(values, dtype=torch.float64, device=self.device)
+        if self.is_distributed:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor.tolist()
+
+    def _distributed_max(self, value):
+        tensor = torch.tensor(float(value), dtype=torch.float64, device=self.device)
+        if self.is_distributed:
+            dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+        return tensor.item()
 
     def _generate_experiment_name(self):
         """Generate experiment name containing hyperparameters."""
@@ -146,8 +171,25 @@ class DiTTrainer:
         generation_str = (
             f"_set{num_part_slots}" if generation_mode == "set" else ""
         )
-        experiment_name = f"{lr_str}_{batch_str}_{epoch_str}{eot_str}{urdf_params_str}{no_3d_whole_str}{history_str}{generation_str}"
+        step_str = (
+            f"_steps{self.max_train_steps}"
+            if self.max_train_steps is not None
+            else ""
+        )
+        experiment_name = f"{lr_str}_{batch_str}_{epoch_str}{eot_str}{urdf_params_str}{no_3d_whole_str}{history_str}{generation_str}{step_str}"
         return experiment_name
+
+    def _generate_wandb_run_name(self):
+        """Generate a compact comparison name while keeping full settings in config."""
+        prefix = self.config.get("wandb_name_prefix")
+        if not prefix:
+            return self.experiment_name
+        history_mode = self.config.get("history_mode", "geometry").replace("_", "-")
+        lr = self.config.get("learning_rate", 1e-4)
+        lr_str = f"{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+        batch_size = self.config.get("batch_size", 2)
+        seed = self.config.get("seed", 42)
+        return f"{prefix}_{history_mode}_lr{lr_str}_bs{batch_size}_seed{seed}"
 
     def train_step(self, batch):
         """Single training step."""
@@ -323,38 +365,92 @@ class DiTTrainer:
         total_loss.backward()
         self.optimizer.step()
 
-        if self.rank == 0 and self.use_wandb and wandb is not None:
-            log_dict = {
-                "train/total_loss": total_loss.item(),
-                "train/learning_rate": self.optimizer.param_groups[0]["lr"],
-                "train/step": self.global_step,
-            }
-            if is_eot.any():
-                log_dict["train/eot_latent_loss"] = eot_latent_loss.item()
-            if is_non_eot.any():
-                log_dict["train/non_eot_latent_loss"] = non_eot_latent_loss.item()
-            wandb.log(log_dict)
-            if (
-                urdf_timestep_mask is not None
+        if self.use_wandb and wandb is not None:
+            eot_count = int(is_eot.sum().item())
+            non_eot_count = int(is_non_eot.sum().item())
+            urdf_metric_count = (
+                urdf_count
+                if urdf_timestep_mask is not None
                 and urdf_timestep_mask.any()
                 and param1_loss is not None
-            ):
-                log_dict_urdf = {
-                    "train/param1_loss": param1_loss.item(),
-                    "train/param2_loss": param2_loss.item(),
-                    "train/param3_loss": param3_loss.item(),
+                else 0
+            )
+            reduced = self._distributed_sums(
+                [
+                    total_loss.item(),
+                    1,
+                    eot_latent_loss.item() * eot_count,
+                    eot_count,
+                    non_eot_latent_loss.item() * non_eot_count,
+                    non_eot_count,
+                    (param1_loss.item() * urdf_metric_count)
+                    if param1_loss is not None
+                    else 0.0,
+                    (param2_loss.item() * urdf_metric_count)
+                    if param2_loss is not None
+                    else 0.0,
+                    (param3_loss.item() * urdf_metric_count)
+                    if param3_loss is not None
+                    else 0.0,
+                    (motion_type_loss.item() * urdf_metric_count)
+                    if motion_type_loss is not None
+                    else 0.0,
+                    urdf_metric_count,
+                ]
+            )
+            (
+                global_loss_sum,
+                global_rank_count,
+                global_eot_loss_sum,
+                global_eot_count,
+                global_non_eot_loss_sum,
+                global_non_eot_count,
+                global_param1_loss_sum,
+                global_param2_loss_sum,
+                global_param3_loss_sum,
+                global_motion_type_loss_sum,
+                global_urdf_count,
+            ) = reduced
+            if self.rank == 0:
+                global_sample_count = global_eot_count + global_non_eot_count
+                log_dict = {
+                    "train/global_step": self.global_step,
+                    "train/step": self.global_step,
+                    "train/total_loss": global_loss_sum / global_rank_count,
+                    "train/learning_rate": self.optimizer.param_groups[0]["lr"],
+                    "train/eot_fraction": (
+                        global_eot_count / global_sample_count
+                        if global_sample_count > 0
+                        else 0.0
+                    ),
                 }
-                if motion_type_pred is not None and urdf_count > 0 and motion_type_loss is not None:
-                    log_dict_urdf["train/motion_type_loss"] = motion_type_loss.item()
-                    # log_dict_urdf["train/motion_type_accuracy"] = motion_type_accuracy
-                    # log_dict_urdf["train/urdf_count"] = urdf_count
-                    # unique_labels, counts = torch.unique(
-                    #     motion_types[urdf_timestep_mask], return_counts=True
-                    # )
-                    # for label, count in zip(unique_labels, counts):
-                    #     label_name = "revolute" if label.item() == 0 else "prismatic"
-                    #     log_dict_urdf[f"train/motion_type_{label_name}_count"] = count.item()
-                wandb.log(log_dict_urdf)
+                if global_eot_count > 0:
+                    log_dict["train/eot_latent_loss"] = (
+                        global_eot_loss_sum / global_eot_count
+                    )
+                if global_non_eot_count > 0:
+                    log_dict["train/non_eot_latent_loss"] = (
+                        global_non_eot_loss_sum / global_non_eot_count
+                    )
+                if global_urdf_count > 0:
+                    log_dict.update(
+                        {
+                            "train/param1_loss": (
+                                global_param1_loss_sum / global_urdf_count
+                            ),
+                            "train/param2_loss": (
+                                global_param2_loss_sum / global_urdf_count
+                            ),
+                            "train/param3_loss": (
+                                global_param3_loss_sum / global_urdf_count
+                            ),
+                            "train/motion_type_loss": (
+                                global_motion_type_loss_sum / global_urdf_count
+                            ),
+                            "train/urdf_count": global_urdf_count,
+                        }
+                    )
+                wandb.log(log_dict)
 
         self.global_step += 1
         return total_loss.item()
@@ -524,17 +620,28 @@ class DiTTrainer:
         totals = {}
         num_batches = 0
         with torch.no_grad():
-            for batch in tqdm(
+            for batch_index, batch in enumerate(tqdm(
                 val_loader, desc="Validating", disable=self.local_rank != 0
-            ):
+            )):
+                if (
+                    self.max_val_steps is not None
+                    and batch_index >= self.max_val_steps
+                ):
+                    break
                 losses = self._compute_set_losses(batch)
                 for name, value in losses.items():
                     totals[name] = totals.get(name, 0.0) + value.item()
                 num_batches += 1
         if num_batches == 0:
             raise ValueError("validation loader is empty")
+        metric_names = sorted(totals)
+        reduced = self._distributed_sums(
+            [totals[name] for name in metric_names] + [num_batches]
+        )
+        global_batches = reduced[-1]
         self.last_set_val_metrics = {
-            name: value / num_batches for name, value in totals.items()
+            name: reduced[index] / global_batches
+            for index, name in enumerate(metric_names)
         }
         metrics = self.last_set_val_metrics
         return (
@@ -568,7 +675,18 @@ class DiTTrainer:
         urdf_count = 0
 
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating", disable=self.local_rank != 0):
+            for batch_index, batch in enumerate(
+                tqdm(
+                    val_loader,
+                    desc="Validating",
+                    disable=self.local_rank != 0,
+                )
+            ):
+                if (
+                    self.max_val_steps is not None
+                    and batch_index >= self.max_val_steps
+                ):
+                    break
                 dino_features_raw = batch["dino_features"].to(self.device)
                 model_to_use = self.model.module if self.is_distributed else self.model
                 dino_features = model_to_use.dino_adapter(dino_features_raw)
@@ -754,6 +872,37 @@ class DiTTrainer:
                 total_latent_loss += latent_loss.item()
                 num_batches += 1
 
+        (
+            total_loss,
+            num_batches,
+            total_param1_loss,
+            total_param2_loss,
+            total_param3_loss,
+            total_motion_type_loss,
+            total_motion_type_accuracy,
+            total_latent_loss,
+            total_eot_latent_loss,
+            total_non_eot_latent_loss,
+            eot_batch_count,
+            non_eot_batch_count,
+            urdf_count,
+        ) = self._distributed_sums(
+            [
+                total_loss,
+                num_batches,
+                total_param1_loss,
+                total_param2_loss,
+                total_param3_loss,
+                total_motion_type_loss,
+                total_motion_type_accuracy,
+                total_latent_loss,
+                total_eot_latent_loss,
+                total_non_eot_latent_loss,
+                eot_batch_count,
+                non_eot_batch_count,
+                urdf_count,
+            ]
+        )
         avg_eot_loss = (
             total_eot_latent_loss / eot_batch_count if eot_batch_count > 0 else 0.0
         )
@@ -809,13 +958,35 @@ class DiTTrainer:
                 desc=f"Epoch {epoch+1}/{max_epochs}",
                 disable=self.local_rank != 0,
             )
-            for batch in pbar:
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(self.device)
+            epoch_started = time.perf_counter()
+            for batch_index, batch in enumerate(pbar):
+                if (
+                    self.max_train_steps is not None
+                    and batch_index >= self.max_train_steps
+                ):
+                    break
                 loss = self.train_step(batch)
                 train_losses.append(loss)
                 if self.local_rank == 0:
                     pbar.set_postfix({"loss": f"{loss:.6f}"})
 
-            avg_train_loss = np.mean(train_losses)
+            train_loss_sum, train_loss_count = self._distributed_sums(
+                [sum(train_losses), len(train_losses)]
+            )
+            avg_train_loss = train_loss_sum / train_loss_count
+            epoch_seconds = self._distributed_max(
+                time.perf_counter() - epoch_started
+            )
+            global_samples_per_second = (
+                train_loss_count * self.config.get("batch_size", 1) / epoch_seconds
+            )
+            peak_reserved_gib = self._distributed_max(
+                torch.cuda.max_memory_reserved(self.device) / (1024**3)
+                if torch.cuda.is_available()
+                else 0.0
+            )
             (
                 val_loss,
                 val_param1_loss,
@@ -836,6 +1007,10 @@ class DiTTrainer:
                     f"Val Param1 Loss: {val_param1_loss:.6f}, Val Param2 Loss: {val_param2_loss:.6f}, "
                     f"Val Param3 Loss: {val_param3_loss:.6f}, Val Latent Loss: {val_latent_loss:.6f}, "
                     f"LR: {self.optimizer.param_groups[0]['lr']:.2e}"
+                )
+                print(
+                    f"  Train Throughput: {global_samples_per_second:.3f} samples/s, "
+                    f"Peak Reserved GPU Memory: {peak_reserved_gib:.3f} GiB"
                 )
                 if self.config.get("train_eot", False):
                     print(
@@ -916,7 +1091,8 @@ class DiTTrainer:
                     "epoch/val_loss": val_loss,
                     "epoch/val_latent_loss": val_latent_loss,
                     "epoch/learning_rate": self.optimizer.param_groups[0]["lr"],
-                    "epoch": epoch,
+                    "epoch/index": epoch + 1,
+                    "epoch": epoch + 1,
                 }
                 if self.config.get("train_eot", False):
                     log_dict["epoch/val_eot_latent_loss"] = val_eot_latent_loss

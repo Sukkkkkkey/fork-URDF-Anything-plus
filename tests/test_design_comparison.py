@@ -17,6 +17,8 @@ from urdf_anything.data.dataset import get_spatial_part_orders
 from urdf_anything.data.urdf_utils import get_motion_history_from_info
 from urdf_anything.inference.runner import select_and_order_part_slots
 from urdf_anything.model.dit_triposg import DiTBlock
+from urdf_anything.model.multi_output_dit import MultiOutputDiTModel
+from urdf_anything.training.trainer import DiTTrainer
 
 
 class MotionHistoryDesignTest(unittest.TestCase):
@@ -82,6 +84,67 @@ class MotionHistoryDesignTest(unittest.TestCase):
         scale, shift = block.motion_adaln(condition).chunk(2, dim=-1)
         torch.testing.assert_close(scale, torch.zeros_like(scale))
         torch.testing.assert_close(shift, torch.zeros_like(shift))
+
+    def test_empty_motion_history_stays_identity_after_bias_update(self):
+        block = DiTBlock(
+            dim=8,
+            num_attention_heads=2,
+            cross_attention_dim=4,
+            cross_attention_norm_type=None,
+            cross_attention_2_dim=4,
+            cross_attention_2_norm_type=None,
+        ).eval()
+        hidden_states = torch.randn(2, 5, 8)
+        image_context = torch.randn(2, 3, 4)
+        geometry_context = torch.randn(2, 6, 4)
+        with torch.no_grad():
+            baseline = block(
+                hidden_states,
+                encoder_hidden_states=image_context,
+                encoder_hidden_states_2=geometry_context,
+            )
+
+        block.enable_motion_adaln(condition_dim=3)
+        torch.nn.init.constant_(block.motion_adaln[-1].weight, 0.1)
+        torch.nn.init.constant_(block.motion_adaln[-1].bias, 0.2)
+        with torch.no_grad():
+            masked = block(
+                hidden_states,
+                encoder_hidden_states=image_context,
+                encoder_hidden_states_2=geometry_context,
+                motion_condition=torch.randn(2, 3),
+                motion_condition_mask=torch.zeros(2, dtype=torch.bool),
+            )
+        torch.testing.assert_close(masked, baseline)
+
+    def test_empty_history_still_keeps_gru_in_ddp_graph(self):
+        model = MultiOutputDiTModel.__new__(MultiOutputDiTModel)
+        torch.nn.Module.__init__(model)
+        model.motion_history_hidden_dim = 4
+        model.motion_history_encoder = torch.nn.GRU(
+            input_size=10, hidden_size=4, batch_first=True
+        )
+        condition = model.encode_motion_history(
+            torch.empty(2, 0, 10), torch.zeros(2, dtype=torch.long)
+        )
+        torch.testing.assert_close(condition, torch.zeros_like(condition))
+        condition.sum().backward()
+        for parameter in model.motion_history_encoder.parameters():
+            self.assertIsNotNone(parameter.grad)
+
+    def test_wandb_comparison_name_contains_confirmed_hyperparameters(self):
+        trainer = DiTTrainer.__new__(DiTTrainer)
+        trainer.config = {
+            "wandb_name_prefix": "comparison_motion-context",
+            "history_mode": "geometry_motion",
+            "learning_rate": 5e-6,
+            "batch_size": 3,
+            "seed": 42,
+        }
+        self.assertEqual(
+            trainer._generate_wandb_run_name(),
+            "comparison_motion-context_geometry-motion_lr5e-6_bs3_seed42",
+        )
 
 
 class SetDenoisingDesignTest(unittest.TestCase):

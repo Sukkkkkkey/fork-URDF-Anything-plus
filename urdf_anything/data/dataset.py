@@ -129,7 +129,9 @@ def collate_fn(batch):
     motion_history_lengths = torch.tensor(
         [item["motion_history"].shape[0] for item in batch], dtype=torch.long
     )
-    max_history_length = int(motion_history_lengths.max().item())
+    # Keep a one-step zero placeholder so every DDP rank executes the GRU even
+    # when its local batch contains only root/first-movable samples.
+    max_history_length = max(1, int(motion_history_lengths.max().item()))
     motion_histories = torch.zeros(
         len(batch), max_history_length, 10, dtype=torch.float32
     )

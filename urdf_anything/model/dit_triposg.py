@@ -215,6 +215,7 @@ class DiTBlock(nn.Module):
         skip: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         motion_condition: Optional[torch.Tensor] = None,
+        motion_condition_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Prepare attention kwargs
         attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
@@ -282,6 +283,12 @@ class DiTBlock(nn.Module):
             if self.motion_adaln is None:
                 raise ValueError("motion_condition requires motion AdaLN to be enabled")
             scale, shift = self.motion_adaln(motion_condition).chunk(2, dim=-1)
+            if motion_condition_mask is not None:
+                motion_condition_mask = motion_condition_mask.to(
+                    device=scale.device, dtype=scale.dtype
+                ).unsqueeze(-1)
+                scale = scale * motion_condition_mask
+                shift = shift * motion_condition_mask
             mlp_inputs = (
                 mlp_inputs * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
             )

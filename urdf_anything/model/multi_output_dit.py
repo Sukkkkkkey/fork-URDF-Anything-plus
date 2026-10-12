@@ -60,23 +60,20 @@ class MultiOutputDiTModel(TripoSGDiTModel):
 
     def encode_motion_history(self, motion_history, motion_history_lengths):
         batch_size = motion_history.shape[0]
-        condition = motion_history.new_zeros(
-            batch_size, self.motion_history_hidden_dim
-        )
-        nonempty = motion_history_lengths > 0
-        if not nonempty.any():
-            return condition
-        indices = nonempty.nonzero(as_tuple=False).flatten()
-        sequences = motion_history.index_select(0, indices)
-        lengths = motion_history_lengths.index_select(0, indices).to("cpu")
+        if motion_history.shape[1] == 0:
+            motion_history = motion_history.new_zeros(
+                batch_size, 1, motion_history.shape[-1]
+            )
+        lengths = motion_history_lengths.clamp_min(1).to("cpu")
         packed = pack_padded_sequence(
-            sequences,
+            motion_history,
             lengths,
             batch_first=True,
             enforce_sorted=False,
         )
         _, hidden = self.motion_history_encoder(packed)
-        return condition.index_copy(0, indices, hidden[-1])
+        nonempty = (motion_history_lengths > 0).to(hidden.dtype).unsqueeze(-1)
+        return hidden[-1] * nonempty
 
     def _create_output_heads(self):
         self.latent_head = nn.Sequential(
@@ -172,6 +169,7 @@ class MultiOutputDiTModel(TripoSGDiTModel):
         temb = self.time_proj(temb)
         temb = temb.unsqueeze(dim=1)
         motion_condition = None
+        motion_condition_mask = None
         if self.history_mode == "geometry_motion":
             if motion_history is None or motion_history_lengths is None:
                 raise ValueError(
@@ -180,6 +178,7 @@ class MultiOutputDiTModel(TripoSGDiTModel):
             motion_condition = self.encode_motion_history(
                 motion_history, motion_history_lengths
             )
+            motion_condition_mask = motion_history_lengths > 0
         hidden_states = self.proj_in(hidden_states)
         hidden_states = torch.cat([temb, hidden_states], dim=1)
         skips = []
@@ -203,6 +202,7 @@ class MultiOutputDiTModel(TripoSGDiTModel):
                     skip,
                     attention_kwargs,
                     motion_condition,
+                    motion_condition_mask,
                     **ckpt_kwargs,
                 )
             else:
@@ -215,6 +215,7 @@ class MultiOutputDiTModel(TripoSGDiTModel):
                     skip=skip,
                     attention_kwargs=attention_kwargs,
                     motion_condition=motion_condition,
+                    motion_condition_mask=motion_condition_mask,
                 )
             if layer < self.config.num_layers // 2:
                 skips.append(hidden_states)

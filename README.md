@@ -109,6 +109,12 @@ For a concise end-to-end reproduction covering environment setup, author data,
 single-sample training, inference, evaluation, and visualization, see
 [`REPRODUCE.md`](REPRODUCE.md).
 
+Local design-comparison work is paused as of 2026-10-12. The motion-cue
+investigation found that training bypasses DDP forward, so the existing multi-GPU
+runs do not establish synchronized-training results. This issue remains unfixed.
+See [the diagnosis and closeout report](MOTION_CUE_DIAGNOSIS.md) for evidence,
+checkpoint locations, and reproduction commands.
+
 ### Data Preparation
 Download the dataset from [Hugging Face](https://huggingface.co/datasets/URDF-Anything-plus/Dataset) and unzip it to `data_normalized/`.
 

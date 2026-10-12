@@ -4,6 +4,10 @@
 默认配置保持作者的 geometry-only 自回归实现，两个改进分别验证，不把它们合并成
 第三种模型。实际跑通结果和产物路径在每项完成后同步写入 `REPRODUCE.md`。
 
+2026-10-12 状态：按用户决定暂停本项工作。两项设计的最小训练已完成，但 motion
+正式微调发现 DDP forward 绕过、梯度未同步，不能作为有效四卡消融结论。
+诊断数据、产物与未完成事项见 [收尾报告](MOTION_CUE_DIAGNOSIS.md)。
+
 ## 共同设置
 
 | 项目 | 固定值 |
@@ -49,6 +53,8 @@ root 使用可学习 `SoT`，后续步骤使用此前所有 part mesh 的联合 
   hidden state 做 AdaLN：`LN(x) * (1 + scale) + shift`。每层独立的
   `SiLU + Linear(256, 2 * 2048)` 产生 scale/shift，Linear 权重和 bias 均零初始化，
   因而载入作者 checkpoint 时新增分支初始严格退化为原 block。
+- 2026-09-18 补充：以 `history_length > 0` 显式 mask scale/shift，保证空历史
+  在 bias 更新后仍退化为原路径；保留零占位 GRU 计算图。这不解决 DDP 同步问题。
 - geometry、URDF 参数与 EOT loss 保持作者训练目标不变，唯一变量是额外历史条件。
 
 已验证 smoke 命令：
@@ -167,3 +173,8 @@ geometry padding      0.028583
 - [x] 对比 2：代码和单元测试
 - [x] 对比 2：Microwave `7201` 一 epoch 最小训练
 - [x] 对比 2：更新 `REPRODUCE.md` 并提交 `add simultaneous part set denoising`
+- [x] 对比 1：正式微调运行完成 10 epochs，保存 epoch 5/10（DDP 缺陷使实验结论受限）
+- [x] 对比 1：固定噪声 checkpoint/motion 开关诊断、DDP 问题复现与收尾报告
+- [ ] DDP 同步修复与修复后的四卡重训练（暂停）
+- [ ] motion cue 的可靠生成质量增益验证（暂停，现有证据不足）
+- [ ] 对比 2：正式训练与全量评估（暂停，仅有 smoke 结果）
